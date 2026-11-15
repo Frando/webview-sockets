@@ -1,0 +1,33 @@
+[package]
+name = "iroh-link-udp-demo-wasm"
+description = "Native UDP demo for iroh-link pages, written in Rust on wasm-native-udp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace: it builds for wasm32-unknown-unknown with
+# `--cfg wasm_native_udp` (see .cargo/config.toml and build.sh).
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-native-udp = { path = "../../wasm-native-udp" }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+js-sys = "0.3.105"
+n0-future = "0.3.2"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# Pinned: build.sh runs the wasm-bindgen CLI of exactly this version.
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4.78"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[lints.rust]
+missing_docs = "deny"

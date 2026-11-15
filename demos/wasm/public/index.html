@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UDP demo (Rust)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Native UDP demo (Rust)</h1>
+  <p class="intro">Sends and receives real UDP datagrams from Rust compiled to
+  wasm. The Rust code uses <code>wasm_native_udp::UdpSocket</code>, which talks
+  to the iroh-link browser. Run <code>udp-echo listen --port 4433</code> on
+  another machine and send to it.</p>
+
+  <section>
+    <h2>Status</h2>
+    <p id="status" class="status pending">checking...</p>
+    <ul id="addrs" class="addrs"></ul>
+  </section>
+
+  <section>
+    <h2>Send</h2>
+    <form id="send-form" class="send">
+      <label>Peer <input id="peer" placeholder="203.0.113.7:4433" autocomplete="off" spellcheck="false"></label>
+      <label>Text <input id="text" value="hello" autocomplete="off"></label>
+      <button id="send" type="submit" disabled>Send</button>
+      <button id="send-gso" type="button" disabled title="One segmented send of 4 datagrams">Send x4 (GSO)</button>
+    </form>
+    <label class="check"><input id="echo" type="checkbox"> Echo mode: reply to every datagram with the same bytes</label>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log" class="log"></pre>
+  </section>
+
+  <details>
+    <summary>Automation</summary>
+    <p><code>?peer=ip:port&amp;send=text&amp;expect=text</code> sends and waits for the
+    reply; <code>?peer=ip:port&amp;gso=4</code> sends 4 datagrams in one segmented
+    send and waits for all echoes;
+    <code>?bench=ip:port[&amp;n=2000&amp;count=20000&amp;window=64&amp;gso=1]</code> runs a
+    1200-byte ping-pong and a windowed throughput test against an echo server;
+    <code>?echo=1</code> starts in echo mode. Results are logged as
+    <code>UDP-DEMO PASS|FAIL ...</code> and set as the page title.</p>
+  </details>
+</main>
+<script type="module" src="main.js"></script>
+</body>
+</html>

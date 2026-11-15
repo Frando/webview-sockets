@@ -1,0 +1,25 @@
+[package]
+name = "iroh-link-udp-demo"
+description = "Native UDP demo for iroh-link pages: plain-JS page and the udp-echo CLI"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not a member of the parent workspace (it is excluded there): the wasm build
+# of the demo needs its own target and cfg settings.
+[workspace]
+
+[[bin]]
+name = "udp-echo"
+path = "src/bin/udp-echo.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+if-addrs = "0.15"
+n0-error = "1.0.1"
+tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+
+[lints.rust]
+missing_docs = "deny"
