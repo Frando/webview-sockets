@@ -1,0 +1,40 @@
+[package]
+name = "iroh-link-udp-host"
+description = "Host side of native UDP sockets for iroh-link web pages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["ws"] }
+data-encoding.workspace = true
+iroh-link-udp-proto = { path = "../iroh-link-udp-proto" }
+n0-error.workspace = true
+netdev = "0.46"
+noq-udp = "1.3"
+rand.workspace = true
+serde.workspace = true
+socket2 = "0.6"
+serde_json = "1"
+tokio = { workspace = true, features = ["sync", "time", "net", "rt", "macros"] }
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws", "tokio", "http1"] }
+clap.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = "0.29"
+tower-http = { version = "0.7", features = ["fs"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

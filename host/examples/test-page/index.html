@@ -1,0 +1,107 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>udp self test</title>
+<style>body { font-family: monospace; margin: 1em; } pre { white-space: pre-wrap; }</style>
+</head>
+<body>
+<h1>irohHost.udp self test</h1>
+<p>Binds two sockets, sends a datagram and a GSO batch from one to the other,
+and checks the results. Optional: <code>?peer=ip:port&amp;send=text&amp;expect=text</code>
+also sends to an external echo server. Result in the title:
+<code>UDP-TEST PASS|FAIL detail</code>.</p>
+<pre id="log"></pre>
+<script>
+(async () => {
+  const log = (...a) => {
+    const line = a.join(" ");
+    document.getElementById("log").textContent += line + "\n";
+    console.log(line);
+  };
+  const done = (ok, detail) => {
+    const t = `UDP-TEST ${ok ? "PASS" : "FAIL"} ${detail}`;
+    document.title = t;
+    log(t);
+  };
+  const withTimeout = (p, ms, what) => Promise.race([
+    p, new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout: ${what}`)), ms)),
+  ]);
+  // Waits for `n` datagrams on `sock`.
+  const collect = (sock, n) => new Promise((resolve) => {
+    const got = [];
+    sock.onmessage = (m) => {
+      got.push(m);
+      if (got.length === n) resolve(got);
+    };
+  });
+  try {
+    if (!window.irohHost) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "/.well-known/iroh-link/host.js";
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("could not load host.js"));
+        document.head.appendChild(s);
+      });
+    }
+    if (!window.irohHost) throw new Error("window.irohHost missing (not a gateway origin?)");
+    const dec = new TextDecoder();
+    const a = await irohHost.udp.bind();
+    const b = await irohHost.udp.bind({ address: "127.0.0.1" });
+    log(`a: ${a.localAddress}:${a.localPort} gso=${a.maxGsoSegments} gro=${a.groSegments}`,
+      `ifaces=${JSON.stringify(a.interfaceAddrs)}`);
+    log(`b: ${b.localAddress}:${b.localPort}`);
+
+    let p = collect(b, 1);
+    a.send("hello", "127.0.0.1", b.localPort);
+    let got = await withTimeout(p, 3000, "single datagram");
+    if (dec.decode(got[0].data) !== "hello") throw new Error("payload mismatch");
+    if (got[0].port !== a.localPort) throw new Error(`bad source port ${got[0].port}`);
+    log("single datagram ok");
+
+    // GSO: 5 segments of 100 bytes, the last 40.
+    const batch = new Uint8Array(440).map((_, i) => i & 0xff);
+    p = collect(b, 5);
+    a.send(batch, "127.0.0.1", b.localPort, { segmentSize: 100 });
+    got = await withTimeout(p, 3000, "gso batch");
+    const sizes = got.map((m) => m.data.length).join(",");
+    if (sizes !== "100,100,100,100,40") throw new Error(`gso sizes ${sizes}`);
+    log("gso batch ok");
+
+    // Many small sends in one tick are batched into one WebSocket message.
+    p = collect(a, 100);
+    for (let i = 0; i < 100; i++) b.send(`m${i}`, "127.0.0.1", a.localPort);
+    got = await withTimeout(p, 3000, "100 datagrams");
+    log(`100 datagrams ok (${new Set(got.map((m) => dec.decode(m.data))).size} distinct)`);
+
+    // Forbidden destination: socket reports an error and stays open.
+    const err = new Promise((resolve) => { a.onerror = resolve; });
+    a.send("x", "224.0.0.1", 9);
+    const e = await withTimeout(err, 3000, "error for multicast");
+    log(`multicast rejected: ${e.code}`);
+
+    const params = new URLSearchParams(location.search);
+    if (params.get("peer")) {
+      const [host, port] = [params.get("peer").replace(/:(\d+)$/, ""), Number(params.get("peer").match(/:(\d+)$/)[1])];
+      p = collect(a, 1);
+      a.send(params.get("send") || "hello", host.replace(/^\[|\]$/g, ""), port);
+      got = await withTimeout(p, 3000, "echo");
+      const text = dec.decode(got[0].data);
+      if (params.get("expect") && text !== params.get("expect")) throw new Error(`echo got ${text}`);
+      log(`echo ok: ${text}`);
+    }
+
+    const closed = new Promise((resolve) => { b.onclose = resolve; });
+    b.close();
+    const c = await withTimeout(closed, 3000, "close");
+    log(`b closed: ${c.code}`);
+    a.close();
+    done(true, "all checks passed");
+  } catch (err) {
+    done(false, `${err.name}: ${err.message}`);
+  }
+})();
+</script>
+</body>
+</html>

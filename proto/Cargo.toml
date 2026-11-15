@@ -1,0 +1,15 @@
+[package]
+name = "iroh-link-udp-proto"
+description = "Wire format between web pages and the host for native UDP sockets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

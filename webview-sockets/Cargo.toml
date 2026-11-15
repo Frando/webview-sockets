@@ -1,0 +1,34 @@
+[package]
+name = "wasm-native-udp"
+description = "A UdpSocket shaped like std::net::UdpSocket that also works in iroh-link web pages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+iroh-link-udp-proto = { path = "../iroh-link-udp-proto" }
+js-sys = "0.3.105"
+tracing = { workspace = true }
+wasm-bindgen = "0.2.128"
+wasm-bindgen-futures = "0.4.78"
+web-sys = { version = "0.3.105", features = [
+    "BinaryType",
+    "CloseEvent",
+    "Event",
+    "MessageEvent",
+    "Url",
+    "WebSocket",
+] }
+
+[[example]]
+name = "node_test"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
