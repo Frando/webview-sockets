@@ -66,7 +66,9 @@ pub struct Demo {
 pub async fn start() -> Result<Demo, JsError> {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
     webview_sockets::init().await.map_err(|e| match e.kind() {
-        io::ErrorKind::Unsupported => js_err(format!("not running in a webview-sockets host app ({e})")),
+        io::ErrorKind::Unsupported => {
+            js_err(format!("not running in a webview-sockets host app ({e})"))
+        }
         _ => js_err(e),
     })?;
     let mut notes = Vec::new();

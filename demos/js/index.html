@@ -9,8 +9,8 @@
 <body>
 <main>
   <h1>Native UDP demo</h1>
-  <p class="intro">Sends and receives real UDP datagrams from this page through
-  <code>window.webviewSockets.udp</code>, which a webview-sockets host app provides.
+  <p class="intro">Sends and receives real UDP datagrams from this page with the
+  Direct Sockets <code>UDPSocket</code>, which a webview-sockets host app provides.
   Run <code>udp-echo listen --port 4433</code> on another machine and send to it.</p>
 
   <section>
@@ -30,6 +30,17 @@
   </section>
 
   <section>
+    <h2>Connected socket</h2>
+    <p class="intro">Opens a second socket in connected mode: the app resolves the
+    host name and the socket only talks to that peer.</p>
+    <form id="connect-form" class="send">
+      <label>Host <input id="target" placeholder="echo.example.org:4433" autocomplete="off" spellcheck="false"></label>
+      <label>Text <input id="ctext" value="hello" autocomplete="off"></label>
+      <button id="connect" type="submit" disabled>Connect and send</button>
+    </form>
+  </section>
+
+  <section>
     <h2>Log</h2>
     <pre id="log" class="log"></pre>
   </section>
@@ -37,7 +48,8 @@
   <details>
     <summary>Automation</summary>
     <p><code>?peer=ip:port&amp;send=text&amp;expect=text</code> sends and waits for the
-    reply; <code>?bench=ip:port[&amp;n=2000&amp;count=20000&amp;window=64]</code> runs a
+    reply; <code>?connect=host:port&amp;send=text&amp;expect=text[&amp;dnsQueryType=ipv4]</code>
+    does the same with a connected socket (host may be a name); <code>?bench=ip:port[&amp;n=2000&amp;count=20000&amp;window=64]</code> runs a
     1200-byte ping-pong and a windowed throughput test against an echo server;
     <code>?echo=1</code> starts in echo mode. Results are logged as
     <code>UDP-DEMO PASS|FAIL ...</code> and set as the page title.</p>

@@ -5,18 +5,20 @@
 //! platform bridge for a session ticket ([`UdpHost::request`],
 //! [`UdpHost::answer`]), then opens one WebSocket per UDP socket on
 //! [`WS_PATH`] of its own origin ([`UdpHost::router`]). The wire format is in
-//! [`webview_sockets_proto`]. The script injected into pages is
-//! [`INJECTED_JS`].
+//! [`webview_sockets_proto`].
 //!
-//! Sockets open in either mode of the Direct Sockets `UDPSocket`: bound to a
-//! local address, or connected to a remote host name or address that the
-//! host resolves.
+//! The script injected into pages ([`UdpHost::injected_js`], [`INJECTED_JS`])
+//! gives them the Direct Sockets `UDPSocket`: bound to a local address, or
+//! connected to a remote host name or address that the host resolves. Its
+//! permission step asks the platform bridge ([`BridgeRequest`],
+//! [`bridge_reply`], [`reply_script`]).
 //!
 //! Access is off by default ([`UdpHost::set_enabled`]) and granted per
 //! origin, either always (persisted) or once (until the tab navigates or
 //! closes).
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -35,8 +37,8 @@ mod session;
 mod sock;
 mod store;
 
-pub use bridge::{BridgeRequest, bridge_reply};
-pub use js::INJECTED_JS;
+pub use bridge::{BridgeRequest, bridge_reply, reply_script};
+pub use js::{INJECTED_JS, injected_js_for};
 pub use policy::HostPolicy;
 pub use webview_sockets_proto::WS_PATH;
 
@@ -211,6 +213,18 @@ impl UdpHost {
                 active,
             }),
         })
+    }
+
+    /// Returns the script to inject into pages.
+    ///
+    /// With [`HostPolicy::patterns`] the script only runs on matching hosts
+    /// ([`injected_js_for`]); with other policies it is [`INJECTED_JS`] and
+    /// runs everywhere, so the app should inject it only into its own pages.
+    pub fn injected_js(&self) -> Cow<'static, str> {
+        match &self.inner.config.host_policy {
+            HostPolicy::Patterns(patterns) => Cow::Owned(injected_js_for(patterns)),
+            HostPolicy::Any | HostPolicy::Only(_) => Cow::Borrowed(INJECTED_JS),
+        }
     }
 
     /// Returns the axum router with the WebSocket route on [`WS_PATH`].

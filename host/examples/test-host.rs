@@ -1,9 +1,10 @@
-//! Dev server for pages using `window.webviewSockets.udp` without an app.
+//! Dev server for pages using webview-sockets (`UDPSocket`) without an app.
 //!
 //! Serves a directory on 127.0.0.1 for any Host, mounts the UDP route, and
 //! serves the injected script at `/.well-known/webview-sockets/polyfill.js` with a dev
 //! adapter that gets sessions from `/.well-known/webview-sockets/dev-session`.
-//! Pages load it when `window.webviewSockets` is missing:
+//! Pages load it when `window.webviewSockets` is missing (it defines
+//! `UDPSocket` unless the browser has a native one):
 //!
 //! ```html
 //! <script src="/.well-known/webview-sockets/polyfill.js"></script>
@@ -26,8 +27,7 @@ use n0_error::{Result, StdResultExt};
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 use webview_sockets_host::{
-    Choice, Decision, HostPolicy, INJECTED_JS, SessionTicket, TabId, UdpHost, UdpHostConfig,
-    bridge_reply,
+    Choice, Decision, HostPolicy, SessionTicket, TabId, UdpHost, UdpHostConfig, bridge_reply,
 };
 
 /// Prepended to the injected script: asks this server for a session when
@@ -61,6 +61,8 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     host: UdpHost,
+    /// Dev adapter plus the injected script.
+    script: String,
     auto_grant: bool,
 }
 
@@ -82,16 +84,13 @@ async fn main() -> Result<()> {
     let policy = if args.any_host {
         HostPolicy::Any
     } else {
-        HostPolicy::from_fn(|host| {
-            host.rsplit_once(':').is_some_and(|(name, port)| {
-                name.ends_with(".localhost") && port.parse::<u16>().is_ok()
-            })
-        })
+        HostPolicy::patterns(["*.localhost:*"])
     };
     let host = UdpHost::new(UdpHostConfig::new(&store, policy))?;
     host.set_enabled(true);
 
     let state = AppState {
+        script: format!("{DEV_ADAPTER}{}", host.injected_js()),
         host: host.clone(),
         auto_grant: args.auto_grant,
     };
@@ -116,13 +115,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn host_js() -> impl IntoResponse {
+async fn host_js(State(state): State<AppState>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        format!("{DEV_ADAPTER}{INJECTED_JS}"),
+        state.script,
     )
 }
 

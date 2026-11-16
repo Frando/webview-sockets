@@ -19,6 +19,8 @@ pub enum HostPolicy {
     Any,
     /// Hosts for which the function returns true.
     Only(Arc<dyn Fn(&str) -> bool + Send + Sync>),
+    /// Hosts matching one of the patterns, see [`HostPolicy::patterns`].
+    Patterns(Arc<[String]>),
 }
 
 impl HostPolicy {
@@ -33,13 +35,41 @@ impl HostPolicy {
         Self::from_fn(move |host| hosts.contains(host))
     }
 
+    /// Returns a policy that allows hosts matching one of `patterns`.
+    ///
+    /// A pattern is a host authority in which `*` matches one or more
+    /// characters other than `.` and `:`, e.g. `*.localhost:*` or
+    /// `app.localhost:8080`. Matching is case sensitive; browsers send
+    /// lowercase hosts. Unlike the other policies, the patterns also gate the
+    /// injected script, see [`crate::UdpHost::injected_js`].
+    pub fn patterns(patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Patterns(patterns.into_iter().map(Into::into).collect())
+    }
+
     /// Returns whether `host` (an authority, `name[:port]`) is allowed.
     pub fn allows(&self, host: &str) -> bool {
         !host.is_empty()
             && match self {
                 Self::Any => true,
                 Self::Only(f) => f(host),
+                Self::Patterns(patterns) => patterns.iter().any(|p| host_matches(p, host)),
             }
+    }
+}
+
+/// Matches `host` against a pattern where `*` stands for one or more
+/// characters other than `.` and `:`. Mirrors `hostMatches` in the injected
+/// script.
+pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == host,
+        Some((head, tail)) => {
+            let Some(rest) = host.strip_prefix(head) else {
+                return false;
+            };
+            let run = rest.find(['.', ':']).unwrap_or(rest.len());
+            (1..=run).any(|n| host_matches(tail, &rest[n..]))
+        }
     }
 }
 
@@ -48,6 +78,7 @@ impl fmt::Debug for HostPolicy {
         match self {
             Self::Any => f.write_str("HostPolicy::Any"),
             Self::Only(_) => f.write_str("HostPolicy::Only(..)"),
+            Self::Patterns(p) => f.debug_tuple("HostPolicy::Patterns").field(p).finish(),
         }
     }
 }
@@ -151,6 +182,17 @@ mod tests {
         assert!(g.allows("abc123.pkarr.localhost:45475"));
         assert!(!g.allows("abc.pkarr.localhost"));
         assert!(!g.allows("Abc.pkarr.localhost:80"));
+        let p = HostPolicy::patterns(["*.localhost:*", "app.test", "a*b.x"]);
+        assert!(p.allows("test.localhost:8080"));
+        assert!(!p.allows("a.b.localhost:8080"));
+        assert!(!p.allows(".localhost:8080"));
+        assert!(!p.allows("test.localhost"));
+        assert!(!p.allows("test.localhost:"));
+        assert!(p.allows("app.test"));
+        assert!(!p.allows("app.test:1"));
+        assert!(p.allows("axyb.x"));
+        assert!(!p.allows("ab.x"));
+        assert!(!p.allows("a.b.x"));
     }
 
     #[test]

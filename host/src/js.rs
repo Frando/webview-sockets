@@ -56,10 +56,16 @@ const fn concat() -> [u8; LEN] {
 
 static BYTES: [u8; LEN] = concat();
 
+/// The line of [`INJECTED_JS`] that [`injected_js_for`] replaces.
+const HOSTS_LINE: &str = "const HOSTS = null; // @@webview-sockets-hosts@@";
+
 /// The classic script to inject into the app's pages at document start.
 ///
-/// It defines `window.webviewSockets` (version 2) with `requestSession()`
-/// and `udp.bind(opts)` in the top frame of http(s) pages. It talks to the
+/// In the top frame of http(s) pages it defines `window.UDPSocket`, the
+/// Direct Sockets `UDPSocket` (unless the browser has a native one), and
+/// `window.webviewSockets` with `version`, `UDPSocket` and
+/// `requestSession()`. This variant runs on every host; see
+/// [`injected_js_for`] for one limited to some hosts. It talks to the
 /// platform over `window.webviewSocketsBridge` (Android web message
 /// listener) or `window.ipc.postMessage` (desktop, replies via
 /// `window.__webviewSocketsReply(id, json)`); requests are JSON
@@ -71,14 +77,34 @@ pub const INJECTED_JS: &str = match core::str::from_utf8(&BYTES) {
     Err(_) => panic!("injected script is not utf-8"),
 };
 
+/// Returns [`INJECTED_JS`] limited to pages whose host matches a pattern.
+///
+/// Patterns are host authorities where `*` matches one or more characters
+/// other than `.` and `:`, as in [`crate::HostPolicy::patterns`]. On other
+/// hosts the script returns without defining anything.
+pub fn injected_js_for<S: AsRef<str>>(patterns: &[S]) -> String {
+    let list: Vec<&str> = patterns.iter().map(AsRef::as_ref).collect();
+    let json = serde_json::to_string(&list).expect("serializable");
+    INJECTED_JS.replacen(HOSTS_LINE, &format!("const HOSTS = {json};"), 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn gated() {
+        assert!(INJECTED_JS.contains(HOSTS_LINE));
+        let js = injected_js_for(&["*.localhost:*", "a\"b"]);
+        assert!(!js.contains(HOSTS_LINE));
+        assert!(js.contains(r#"const HOSTS = ["*.localhost:*","a\"b"];"#));
+    }
+
+    #[test]
     fn assembled() {
         assert!(INJECTED_JS.contains("const webviewSocketsCodec"));
         assert!(INJECTED_JS.contains("requestSession"));
+        assert!(INJECTED_JS.contains("class UDPSocket"));
         assert!(!INJECTED_JS.contains(CODEC_MARKER));
         assert!(!INJECTED_JS.contains("\nexport "));
         assert!(INJECTED_JS.is_ascii());

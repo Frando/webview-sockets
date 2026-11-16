@@ -77,6 +77,20 @@ pub fn bridge_reply(id: u64, result: Result<&SessionTicket, &str>) -> String {
     serde_json::to_string(&reply).expect("serializable")
 }
 
+/// Returns a script that delivers a bridge reply to a desktop page.
+///
+/// For hosts whose bridge has no reply channel (wry's `window.ipc`): run it
+/// with `evaluate_script`. It only delivers if the page is still on `origin`,
+/// so a page that navigated meanwhile never sees the token.
+pub fn reply_script(origin: &str, id: u64, reply_json: &str) -> String {
+    let origin = serde_json::to_string(origin).expect("serializable");
+    let json = serde_json::to_string(reply_json).expect("serializable");
+    format!(
+        "if (location.origin === {origin} && window.__webviewSocketsReply) \
+         window.__webviewSocketsReply({id}, {json});"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +115,15 @@ mod tests {
         assert_eq!(
             bridge_reply(8, Err("NotAllowed")),
             r#"{"id":8,"ok":false,"error":"NotAllowed"}"#
+        );
+    }
+
+    #[test]
+    fn reply_scripts() {
+        let script = reply_script("http://a.localhost:5", 3, r#"{"id":3,"ok":false}"#);
+        assert_eq!(
+            script,
+            r#"if (location.origin === "http://a.localhost:5" && window.__webviewSocketsReply) window.__webviewSocketsReply(3, "{\"id\":3,\"ok\":false}");"#
         );
     }
 }
