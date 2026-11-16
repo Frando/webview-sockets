@@ -1,5 +1,5 @@
 // Checks js/codec.js against testdata/vectors.json (written by the Rust test
-// tests/vectors.rs). Run: node udp-proto/js/codec.test.mjs
+// tests/vectors.rs). Run: node proto/js/codec.test.mjs
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -33,8 +33,8 @@ function checkVectors(c, label) {
           const f = c.decodeFirst(bytes);
           if (f.kind === "hello") {
             assert.deepEqual({ ...f, token: toHex(f.token) }, exp);
-            assert.equal(toHex(c.encodeHello(exp.token, exp.bindAddr)), v.hex);
-            assert.equal(toHex(c.encodeHello(fromHex(exp.token), exp.bindAddr)), v.hex);
+            assert.equal(toHex(c.encodeHello(exp.token, exp)), v.hex);
+            assert.equal(toHex(c.encodeHello(fromHex(exp.token), exp)), v.hex);
           } else if (f.kind === "bound") {
             assert.deepEqual(f, exp);
             assert.equal(toHex(c.encodeBound(exp)), v.hex);
@@ -45,7 +45,8 @@ function checkVectors(c, label) {
           }
           break;
         }
-        case "data": {
+        case "data":
+        case "records": {
           const recs = c.decodeData(bytes);
           assert.deepEqual(recs.map((r) => ({ ...r, payload: toHex(r.payload) })), exp);
           // Zero copy: payloads share the input buffer.
@@ -72,11 +73,11 @@ checkVectors(codec, "module");
 // The classic-script part (everything above the export marker) must work
 // when evaluated as a plain script, as the hosts inject it.
 const src = readFileSync(new URL("codec.js", here), "utf8");
-const marker = "// @@iroh-link-udp-codec-module-exports@@";
+const marker = "// @@webview-sockets-codec-module-exports@@";
 assert.ok(src.includes(marker), "export marker missing");
 const classic = src.split(marker)[0];
 const ctx = vm.createContext({ TextEncoder, TextDecoder, Uint8Array, DataView, ArrayBuffer });
-vm.runInContext(`(function () {\n${classic}\nglobalThis.codec = irohLinkUdpCodec;\n})();`, ctx);
+vm.runInContext(`(function () {\n${classic}\nglobalThis.codec = webviewSocketsCodec;\n})();`, ctx);
 // Objects from another realm fail deepEqual prototype checks; compare via JSON.
 const classicCodec = {
   ...ctx.codec,
@@ -86,9 +87,11 @@ const classicCodec = {
 };
 test("classic: hello roundtrip", () => {
   const token = "ab".repeat(32);
-  const hello = classicCodec.decodeFirst(ctx.codec.encodeHello(token, { address: "::1", port: 5 }));
+  const hello = classicCodec.decodeFirst(ctx.codec.encodeHello(token, { localAddress: "::1", localPort: 5 }));
   assert.equal(toHex(hello.token), token);
-  assert.deepEqual({ ...hello.bindAddr }, { address: "::1", port: 5 });
+  assert.equal(hello.mode, "bound");
+  assert.equal(hello.localAddress, "::1");
+  assert.equal(hello.localPort, 5);
 });
 test("classic: data roundtrip", () => {
   const msg = ctx.codec.encodeData({ address: "10.0.0.1", port: 9, payload: "hi" });
@@ -103,10 +106,40 @@ test("splitSegments", () => {
   assert.equal(codec.splitSegments(one).length, 1);
 });
 
+test("hello defaults", () => {
+  const t = "ab".repeat(32);
+  const bound = codec.decodeFirst(codec.encodeHello(t));
+  assert.deepEqual(
+    { mode: bound.mode, localAddress: bound.localAddress, localPort: bound.localPort, ipv6Only: bound.ipv6Only },
+    { mode: "bound", localAddress: "0.0.0.0", localPort: 0, ipv6Only: null },
+  );
+  const conn = codec.decodeFirst(codec.encodeHello(t, { remoteAddress: "[::1]", remotePort: 7 }));
+  assert.equal(conn.mode, "connected");
+  assert.equal(conn.remoteAddress, "[::1]");
+  assert.equal(conn.dnsQueryType, null);
+});
+
+test("named data records", () => {
+  const msg = codec.encodeData([
+    { address: "example.com", port: 53, payload: "q", dnsQueryType: "ipv4" },
+    { address: "[::1]", port: 9, payload: "x" },
+  ]);
+  const [named, plain] = codec.decodeData(msg);
+  assert.equal(named.address, "example.com");
+  assert.equal(named.dnsQueryType, "ipv4");
+  assert.equal(plain.address, "::1");
+  assert.equal(plain.dnsQueryType, undefined);
+  assert.throws(() => codec.encodeData({ address: "", port: 1, payload: "" }), TypeError);
+  assert.throws(() => codec.encodeData({ address: "a.b", port: 1, payload: "", dnsQueryType: "v4" }), TypeError);
+});
+
 test("encode input validation", () => {
-  assert.throws(() => codec.encodeHello("ab", { address: "0.0.0.0", port: 0 }), TypeError);
-  assert.throws(() => codec.encodeHello("ab".repeat(32), { address: "1.2.3", port: 0 }), TypeError);
-  assert.throws(() => codec.encodeHello("ab".repeat(32), { address: "1.2.3.4", port: 70000 }), TypeError);
+  assert.throws(() => codec.encodeHello("ab", {}), TypeError);
+  assert.throws(() => codec.encodeHello("ab".repeat(32), { localAddress: "1.2.3", localPort: 0 }), TypeError);
+  assert.throws(() => codec.encodeHello("ab".repeat(32), { localAddress: "1.2.3.4", localPort: 70000 }), TypeError);
+  assert.throws(() => codec.encodeHello("ab".repeat(32), { remoteAddress: "a.b", remotePort: 70000 }), TypeError);
+  assert.throws(() => codec.encodeHello("ab".repeat(32), { remoteAddress: "a.b", remotePort: 1, dnsQueryType: "x" }), TypeError);
+  assert.throws(() => codec.encodeHello("ab".repeat(32), { sendBufferSize: -1 }), TypeError);
   assert.throws(() => codec.encodeData({ address: "1:2:3", port: 1, payload: "" }), TypeError);
   assert.throws(() => codec.encodeData({ address: "::1", port: 1, payload: 5 }), TypeError);
   const big = new Uint8Array(codec.MAX_MESSAGE_LEN);

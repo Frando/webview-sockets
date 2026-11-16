@@ -7,9 +7,9 @@
 //   ?bench=ip:port[&n=2000&count=20000&window=64&gso=1]  RTT + throughput vs an echo server
 //   ?echo=1                              start in echo mode
 // Results: console line and document.title "UDP-DEMO PASS|FAIL <detail>".
-import initWasm, { start } from "./wasm/iroh_link_udp_demo_wasm.js";
+import initWasm, { start } from "./wasm/webview_sockets_demo_wasm.js";
 
-const HOST_JS = "/.well-known/iroh-link/host.js";
+const HOST_JS = "/.well-known/webview-sockets/polyfill.js";
 const MAX_LOG_LINES = 500;
 
 const $ = (id) => document.getElementById(id);
@@ -52,9 +52,9 @@ function addrRow(label, value) {
   $("addrs").append(li);
 }
 
-// Outside the iroh-link apps, try the test-host dev script.
+// Outside a webview-sockets host app, try the test-host dev script.
 async function loadHostScript() {
-  if (window.irohHost) return;
+  if (window.webviewSockets) return;
   await new Promise((resolve) => {
     const s = document.createElement("script");
     s.src = HOST_JS;

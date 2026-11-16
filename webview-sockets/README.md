@@ -1,23 +1,22 @@
-# wasm-native-udp
+# webview-sockets
 
 A UDP socket shaped like `std::net::UdpSocket` that also works in web pages
-opened in the iroh link apps. On native targets it wraps the std socket. On
-`wasm32-unknown-unknown` with `--cfg wasm_native_udp`, the socket lives in the
-app and the page talks to it over a WebSocket (see
-[`iroh-link-udp-host`](../udp-host/README.md) and
-[`iroh-link-udp-proto`](../udp-proto/README.md)). Without the cfg,
-every call fails with `Unsupported`.
+whose webview app runs [`webview-sockets-host`](../host/README.md). On native
+targets it wraps the std socket. On `wasm32-unknown-unknown` with
+`--cfg webview_sockets`, the socket lives in the app and the page talks to
+it over a WebSocket (see [`webview-sockets-proto`](../proto/README.md)).
+Without the cfg, every call fails with `Unsupported`.
 
 On wasm the socket behaves like a non-blocking std socket and offers
-poll and async helpers to wait, plus GSO and GRO style batching. It is what
-the forked `netwatch` uses to run iroh in a page, see the
-[demos](../demos/README.md).
+poll and async helpers to wait, plus GSO and GRO style batching.
+`UdpSocket::connect_host` opens a socket connected to a host name that the
+app resolves. A fork of `netwatch` uses this crate to run iroh in a page.
 
 ```sh
-cargo test -p wasm-native-udp
+cargo test -p webview-sockets
 # The wasm backend, under Node against a mock host (Node >= 22 and the
-# wasm-bindgen CLI matching the crate version):
-WASM_BINDGEN=<path to wasm-bindgen> wasm-native-udp/tests/node/run.sh
+# wasm-bindgen CLI matching the pinned version, 0.2.128):
+WASM_BINDGEN=<path to wasm-bindgen> webview-sockets/tests/node/run.sh
 ```
 
 ## License

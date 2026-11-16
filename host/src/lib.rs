@@ -1,11 +1,16 @@
-//! Host side of native UDP sockets for iroh-link web pages.
+//! Host side of webview-sockets: native UDP sockets for pages in a webview.
 //!
-//! A page on a gateway origin (`http://<label>.(blake3|pkarr).localhost:<port>`)
-//! asks the platform bridge for a session ticket ([`UdpHost::request`],
+//! An app embeds a webview and serves its pages over HTTP from a local
+//! server. A page on an origin the app allows (see [`HostPolicy`]) asks the
+//! platform bridge for a session ticket ([`UdpHost::request`],
 //! [`UdpHost::answer`]), then opens one WebSocket per UDP socket on
 //! [`WS_PATH`] of its own origin ([`UdpHost::router`]). The wire format is in
-//! [`iroh_link_udp_proto`]. The script injected into pages is
+//! [`webview_sockets_proto`]. The script injected into pages is
 //! [`INJECTED_JS`].
+//!
+//! Sockets open in either mode of the Direct Sockets `UDPSocket`: bound to a
+//! local address, or connected to a remote host name or address that the
+//! host resolves.
 //!
 //! Access is off by default ([`UdpHost::set_enabled`]) and granted per
 //! origin, either always (persisted) or once (until the tab navigates or
@@ -18,10 +23,10 @@ use std::{
     time::Duration,
 };
 
-use iroh_link_udp_proto::{TOKEN_LEN, close_code};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
+use webview_sockets_proto::{TOKEN_LEN, close_code};
 
 mod bridge;
 mod js;
@@ -31,8 +36,9 @@ mod sock;
 mod store;
 
 pub use bridge::{BridgeRequest, bridge_reply};
-pub use iroh_link_udp_proto::WS_PATH;
 pub use js::INJECTED_JS;
+pub use policy::HostPolicy;
+pub use webview_sockets_proto::WS_PATH;
 
 /// Identifies a browser tab, as chosen by the platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -52,6 +58,11 @@ pub struct Limits {
     pub recv_queue_len: usize,
     /// Time the page has to send HELLO after the WebSocket opened.
     pub hello_timeout: Duration,
+    /// Time allowed for resolving a host name.
+    pub resolve_timeout: Duration,
+    /// Upper bound for the kernel send and receive buffer sizes a page may
+    /// request; also the size used when the page requests none.
+    pub max_socket_buffer: usize,
 }
 
 impl Default for Limits {
@@ -59,9 +70,11 @@ impl Default for Limits {
         Self {
             max_sockets_per_origin: 8,
             max_sockets_per_token: 8,
-            max_message_len: iroh_link_udp_proto::MAX_MESSAGE_LEN,
+            max_message_len: webview_sockets_proto::MAX_MESSAGE_LEN,
             recv_queue_len: 64,
             hello_timeout: Duration::from_secs(5),
+            resolve_timeout: Duration::from_secs(10),
+            max_socket_buffer: 2 * 1024 * 1024,
         }
     }
 }
@@ -73,20 +86,17 @@ pub struct UdpHostConfig {
     pub store_path: PathBuf,
     /// Resource limits.
     pub limits: Limits,
-    /// Require gateway hosts and origins (`<label>.(blake3|pkarr).localhost:<port>`).
-    ///
-    /// Only dev tools turn this off. `Origin` must equal `"http://" + Host`
-    /// in either case.
-    pub check_host: bool,
+    /// Which page hosts may use sockets.
+    pub host_policy: HostPolicy,
 }
 
 impl UdpHostConfig {
-    /// Returns a config with default limits and host checks on.
-    pub fn new(store_path: impl Into<PathBuf>) -> Self {
+    /// Returns a config with default limits.
+    pub fn new(store_path: impl Into<PathBuf>, host_policy: HostPolicy) -> Self {
         Self {
             store_path: store_path.into(),
             limits: Limits::default(),
-            check_host: true,
+            host_policy,
         }
     }
 }
@@ -98,7 +108,7 @@ pub enum Decision {
     Granted(SessionTicket),
     /// Ask the user, then call [`UdpHost::answer`].
     NeedPrompt,
-    /// The user blocked the origin, or the origin is not a gateway origin.
+    /// The user blocked the origin, or the [`HostPolicy`] does not allow it.
     Denied,
     /// The UDP setting is off.
     Disabled,
@@ -177,7 +187,7 @@ struct SessionEntry {
 }
 
 impl UdpHost {
-    /// The script to inject into gateway pages, same as [`INJECTED_JS`].
+    /// The script to inject into pages, same as [`INJECTED_JS`].
     pub const INJECTED_JS: &'static str = INJECTED_JS;
 
     /// Creates a host, loading grants and the enabled flag from the store.
@@ -205,7 +215,7 @@ impl UdpHost {
 
     /// Returns the axum router with the WebSocket route on [`WS_PATH`].
     ///
-    /// Merge it into the server that serves the gateway origins.
+    /// Merge it into the server that serves the app's pages.
     pub fn router(&self) -> axum::Router {
         session::router(self.clone())
     }
@@ -220,7 +230,7 @@ impl UdpHost {
             return Decision::Disabled;
         }
         if !self.origin_ok(origin) {
-            debug!(%origin, "udp request from a non-gateway origin");
+            debug!(%origin, "udp request from an origin the host policy denies");
             return Decision::Denied;
         }
         match state.stored.grants.get(origin) {
@@ -236,7 +246,7 @@ impl UdpHost {
     /// Records the user's answer to a prompt and returns a ticket if allowed.
     ///
     /// Returns `None` for [`Choice::Block`], when the setting is off, or for
-    /// a non-gateway origin.
+    /// an origin the [`HostPolicy`] denies.
     pub fn answer(&self, origin: &str, tab: TabId, choice: Choice) -> Option<SessionTicket> {
         if !self.origin_ok(origin) {
             return None;
@@ -337,7 +347,7 @@ impl UdpHost {
     }
 
     fn origin_ok(&self, origin: &str) -> bool {
-        policy::origin_ok(origin, self.inner.config.check_host)
+        policy::origin_ok(origin, &self.inner.config.host_policy)
     }
 
     fn save(&self, state: &State) {

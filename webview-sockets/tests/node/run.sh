@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the node_test example for wasm with --cfg wasm_native_udp and runs it
+# Builds the node_test example for wasm with --cfg webview_sockets and runs it
 # under Node against tests/node/mock-host.mjs.
 #
 # Needs: rustup target wasm32-unknown-unknown, Node >= 22, and wasm-bindgen
@@ -8,11 +8,11 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 build_dir="${CARGO_BUILD_BUILD_DIR:-$repo/target}"
-out="${OUT_DIR:-/tmp/wasm-native-udp-node-test}"
+out="${OUT_DIR:-/tmp/webview-sockets-node-test}"
 wasm_bindgen="${WASM_BINDGEN:-wasm-bindgen}"
 
 cd "$repo"
-RUSTFLAGS='--cfg wasm_native_udp' cargo build -p wasm-native-udp \
+RUSTFLAGS='--cfg webview_sockets' cargo build -p webview-sockets \
   --example node_test --target wasm32-unknown-unknown
 # Final artifacts go to the target dir, not the build dir.
 target_dir="$(cargo metadata --format-version 1 --no-deps | node -e \

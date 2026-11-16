@@ -1,6 +1,8 @@
-// Codec for the iroh-link UDP wire format v1.
+// Codec for the webview-sockets wire format v2.
 //
-// Mirrors the Rust crate iroh-link-udp-proto. Addresses are
+// Mirrors the Rust crate webview-sockets-proto. HELLO and BOUND use the
+// option and open-info names of the Direct Sockets UDPSocket (localAddress,
+// remotePort, dnsQueryType, ...). DATA records and interface addresses are
 // { address: string, port: number }; IPv6 addresses use the same text form as
 // Rust's Ipv6Addr Display (RFC 5952, "::ffff:a.b.c.d" for IPv4-mapped).
 //
@@ -8,25 +10,33 @@
 //   import { encodeHello, decodeFirst, encodeData, decodeData } from "./codec.js";
 //
 // Use in a classic (injected) script: take everything above the export marker
-// line near the end of this file (Rust: iroh_link_udp_proto::js_codec_classic())
+// line near the end of this file (Rust: webview_sockets_proto::js_codec_classic())
 // and paste it inside your own IIFE. It declares one binding,
-// `irohLinkUdpCodec`, holding all functions and constants.
+// `webviewSocketsCodec`, holding all functions and constants.
 //
 // Errors are thrown as Error objects with name "UdpCodecError" and a `code`
 // matching the Rust DecodeError::name(), e.g. "Truncated", "UnknownKind".
 
-const irohLinkUdpCodec = (() => {
+const webviewSocketsCodec = (() => {
   "use strict";
 
-  const VERSION = 1;
+  const VERSION = 2;
   const MAX_MESSAGE_LEN = 256 * 1024;
   const TOKEN_LEN = 32;
-  const WS_PATH = "/.well-known/iroh-link/udp";
+  const WS_PATH = "/.well-known/webview-sockets/udp";
   const KIND_HELLO = 0x01;
   const KIND_BOUND = 0x02;
   const KIND_ERROR = 0x03;
   const KIND_DATA = 0x10;
-  const ERROR_CODES = { 1: "NotAllowed", 2: "InvalidInput", 3: "AddrInUse", 4: "Limit", 5: "Io" };
+  const KIND_DATA_NAMED = 0x11;
+  const MAX_HOST_LEN = 255;
+  const MODE_BOUND = 0;
+  const MODE_CONNECTED = 1;
+  const ERROR_CODES = {
+    1: "NotAllowed", 2: "InvalidInput", 3: "AddrInUse", 4: "Limit", 5: "Io", 6: "NameNotResolved",
+  };
+  const DNS_TO_BYTE = { ipv4: 4, ipv6: 6 };
+  const BYTE_TO_DNS = { 0: null, 4: "ipv4", 6: "ipv6" };
   const CLOSE_CODES = {
     NORMAL: 1000, REVOKED: 4001, SETTING_OFF: 4002, NAVIGATED: 4003, LIMIT: 4004, IO_ERROR: 4005,
   };
@@ -141,6 +151,38 @@ const irohLinkUdpCodec = (() => {
     throw invalid(`invalid IP address: ${addr.address}`);
   }
 
+  // Returns the IP bytes of a literal (IPv6 with or without brackets), or null.
+  function ipLiteral(address) {
+    if (typeof address !== "string") return null;
+    return parseIpv4(address) ?? (address.includes(":") ? parseIpv6(address) : null);
+  }
+
+  // Host name as UTF-8, cut to MAX_HOST_LEN at a char boundary like Rust.
+  function hostBytes(host) {
+    if (typeof host !== "string") throw invalid("host must be a string");
+    return cutUtf8(utf8Enc.encode(host), MAX_HOST_LEN);
+  }
+
+  function cutUtf8(bytes, max) {
+    if (bytes.length <= max) return bytes;
+    let end = max;
+    while ((bytes[end] & 0xc0) === 0x80) end--;
+    return bytes.subarray(0, end);
+  }
+
+  function dnsByte(dnsQueryType) {
+    if (dnsQueryType === undefined || dnsQueryType === null) return 0;
+    const b = DNS_TO_BYTE[dnsQueryType];
+    if (!b) throw invalid(`invalid dnsQueryType: ${dnsQueryType}`);
+    return b;
+  }
+
+  function checkU32(name, v) {
+    if (v === undefined || v === null) return 0;
+    if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) throw invalid(`invalid ${name}: ${v}`);
+    return v;
+  }
+
   function checkPort(port) {
     if (!Number.isInteger(port) || port < 0 || port > 0xffff) throw invalid(`invalid port: ${port}`);
     return port;
@@ -178,6 +220,19 @@ const irohLinkUdpCodec = (() => {
     u16() { this.need(2); const v = this.view.getUint16(this.pos); this.pos += 2; return v; }
     u32() { this.need(4); const v = this.view.getUint32(this.pos); this.pos += 4; return v; }
     take(n) { this.need(n); const b = this.buf.subarray(this.pos, this.pos + n); this.pos += n; return b; }
+    dns() {
+      const b = this.u8();
+      if (!(b in BYTE_TO_DNS)) throw codecError("BadDnsQueryType", `bad dns query type ${b}`);
+      return BYTE_TO_DNS[b];
+    }
+    host() {
+      const raw = this.take(this.u8());
+      try {
+        return utf8Dec.decode(raw);
+      } catch {
+        throw codecError("InvalidUtf8", "string is not valid utf-8");
+      }
+    }
     addr() {
       const family = this.u8();
       let address;
@@ -213,24 +268,69 @@ const irohLinkUdpCodec = (() => {
   // ---- encoders ----
 
   // token: Uint8Array(32) or a 64-char hex string as returned by requestSession().
-  function encodeHello(token, bindAddr = { address: "0.0.0.0", port: 0 }) {
+  // options: Direct Sockets UDPSocketOptions. With remoteAddress the socket is
+  // connected ({ remoteAddress, remotePort, dnsQueryType? }, remoteAddress may
+  // be a host name), else bound ({ localAddress = "0.0.0.0", localPort = 0,
+  // ipv6Only? }). sendBufferSize and receiveBufferSize work in both modes.
+  // Checks only what the wire needs; the Direct Sockets option rules are up to
+  // the caller.
+  function encodeHello(token, options = {}) {
     const t = typeof token === "string" ? hexToBytes(token) : toBytes(token);
     if (t.length !== TOKEN_LEN) throw invalid(`token must be ${TOKEN_LEN} bytes`);
-    const w = new Writer(2 + TOKEN_LEN + addrLen(bindAddr));
-    w.u8(KIND_HELLO);
-    w.u8(VERSION);
-    w.bytes(t);
-    w.addr(bindAddr);
+    const sendBufferSize = checkU32("sendBufferSize", options.sendBufferSize);
+    const receiveBufferSize = checkU32("receiveBufferSize", options.receiveBufferSize);
+    const connected = options.remoteAddress !== undefined && options.remoteAddress !== null;
+    let w;
+    if (connected) {
+      const host = hostBytes(options.remoteAddress);
+      const dns = dnsByte(options.dnsQueryType);
+      w = new Writer(2 + TOKEN_LEN + 8 + 3 + host.length + 2);
+      head(w);
+      w.u8(MODE_CONNECTED);
+      w.u8(dns);
+      w.u8(host.length);
+      w.bytes(host);
+      w.u16(checkPort(options.remotePort));
+    } else {
+      const local = { address: options.localAddress ?? "0.0.0.0", port: options.localPort ?? 0 };
+      const v6only = options.ipv6Only;
+      if (v6only !== undefined && v6only !== null && typeof v6only !== "boolean") {
+        throw invalid(`invalid ipv6Only: ${v6only}`);
+      }
+      w = new Writer(2 + TOKEN_LEN + 8 + 1 + addrLen(local) + 1);
+      head(w);
+      w.u8(MODE_BOUND);
+      w.addr(local);
+      w.u8(v6only === true ? 2 : v6only === false ? 1 : 0);
+    }
     return w.buf;
+
+    function head(w) {
+      w.u8(KIND_HELLO);
+      w.u8(VERSION);
+      w.bytes(t);
+      w.u32(sendBufferSize);
+      w.u32(receiveBufferSize);
+    }
   }
 
-  // For tests and mock hosts.
-  function encodeBound({ local, maxGsoSegments = 1, groSegments = 1, interfaceAddrs = [] }) {
+  // For tests and mock hosts. Takes the shape decodeFirst returns:
+  // { localAddress, localPort, remoteAddress?, remotePort?, maxGsoSegments?,
+  //   groSegments?, interfaceAddrs? }.
+  function encodeBound({
+    localAddress, localPort, remoteAddress = null, remotePort = null,
+    maxGsoSegments = 1, groSegments = 1, interfaceAddrs = [],
+  }) {
+    const local = { address: localAddress, port: localPort };
+    const remote = remoteAddress === null ? null : { address: remoteAddress, port: remotePort };
     const addrs = interfaceAddrs.slice(0, 255);
-    const size = 1 + addrLen(local) + 5 + addrs.reduce((n, a) => n + addrLen(a), 0);
+    const size = 1 + addrLen(local) + 1 + (remote ? addrLen(remote) : 0) + 5
+      + addrs.reduce((n, a) => n + addrLen(a), 0);
     const w = new Writer(size);
     w.u8(KIND_BOUND);
     w.addr(local);
+    w.u8(remote ? 1 : 0);
+    if (remote) w.addr(remote);
     w.u16(maxGsoSegments);
     w.u16(groSegments);
     w.u8(addrs.length);
@@ -243,13 +343,8 @@ const irohLinkUdpCodec = (() => {
     const num = typeof code === "number" ? code
       : Number(Object.keys(ERROR_CODES).find((k) => ERROR_CODES[k] === code));
     if (!ERROR_CODES[num]) throw invalid(`unknown error code ${code}`);
-    let m = utf8Enc.encode(message);
-    if (m.length > 0xffff) {
-      // Cut at a char boundary, like the Rust encoder.
-      let end = 0xffff;
-      while ((m[end] & 0xc0) === 0x80) end--;
-      m = m.subarray(0, end);
-    }
+    // Cut at a char boundary, like the Rust encoder.
+    const m = cutUtf8(utf8Enc.encode(message), 0xffff);
     const w = new Writer(4 + m.length);
     w.u8(KIND_ERROR);
     w.u8(num);
@@ -258,23 +353,49 @@ const irohLinkUdpCodec = (() => {
     return w.buf;
   }
 
-  // records: one record or an array of { address, port, payload, ecn?, segmentSize? }.
+  // records: one record or an array of
+  //   { address, port, payload, ecn?, segmentSize?, dnsQueryType? }.
   // payload: Uint8Array | ArrayBuffer | ArrayBufferView | string (UTF-8).
-  // Returns one message; throws if it would exceed MAX_MESSAGE_LEN.
+  // An address that is not an IP literal is a host name: the record becomes a
+  // DATA_NAMED record (page to host, bound mode only) and dnsQueryType picks
+  // the address family. Returns one message; throws if it would exceed
+  // MAX_MESSAGE_LEN.
   function encodeData(records) {
     const list = Array.isArray(records) ? records : [records];
-    const prepared = list.map((r) => ({ r, payload: toBytes(r.payload) }));
-    const size = prepared.reduce((n, { r, payload }) => n + 8 + addrLen(r) + payload.length, 0);
+    const prepared = list.map((r) => {
+      const payload = toBytes(r.payload);
+      const ip = ipLiteral(r.address);
+      if (!ip && typeof r.address === "string" && r.address.includes(":")) {
+        throw invalid(`invalid IP address: ${r.address}`);
+      }
+      if (ip) return { r, payload, ip, size: 8 + ip.length + 3 + payload.length };
+      const host = hostBytes(r.address);
+      if (host.length === 0) throw invalid("address must not be empty");
+      return { r, payload, host, size: 12 + host.length + payload.length };
+    });
+    const size = prepared.reduce((n, p) => n + p.size, 0);
     if (size > MAX_MESSAGE_LEN) {
       throw codecError("Oversize", `message of ${size} bytes exceeds ${MAX_MESSAGE_LEN} bytes`);
     }
     const w = new Writer(size);
-    for (const { r, payload } of prepared) {
-      w.u8(KIND_DATA);
-      w.u8((r.ecn ?? 0) & 3);
-      w.addr(r);
+    for (const { r, payload, ip, host } of prepared) {
       const seg = r.segmentSize ?? 0;
       if (!Number.isInteger(seg) || seg < 0 || seg > 0xffff) throw invalid(`invalid segmentSize: ${seg}`);
+      const port = checkPort(r.port);
+      if (ip) {
+        w.u8(KIND_DATA);
+        w.u8((r.ecn ?? 0) & 3);
+        w.u8(ip.length === 4 ? 4 : 6);
+        w.bytes(ip);
+        w.u16(port);
+      } else {
+        w.u8(KIND_DATA_NAMED);
+        w.u8((r.ecn ?? 0) & 3);
+        w.u8(dnsByte(r.dnsQueryType));
+        w.u8(host.length);
+        w.bytes(host);
+        w.u16(port);
+      }
       w.u16(seg);
       w.u32(payload.length);
       w.bytes(payload);
@@ -290,9 +411,14 @@ const irohLinkUdpCodec = (() => {
   }
 
   // Decodes a message holding a single HELLO, BOUND or ERROR frame. Returns
-  //   { kind: "hello", version, token: Uint8Array, bindAddr }
-  //   { kind: "bound", local, maxGsoSegments, groSegments, interfaceAddrs }
+  //   { kind: "hello", version, token: Uint8Array, sendBufferSize,
+  //     receiveBufferSize, mode: "bound", localAddress, localPort, ipv6Only }
+  //   { kind: "hello", ..., mode: "connected", remoteAddress, remotePort,
+  //     dnsQueryType }
+  //   { kind: "bound", localAddress, localPort, remoteAddress, remotePort,
+  //     maxGsoSegments, groSegments, interfaceAddrs: [{ address, port }] }
   //   { kind: "error", code: number, codeName: string, message }
+  // Absent optional values (ipv6Only, dnsQueryType, remote*) are null.
   function decodeFirst(bytes) {
     bytes = toBytes(bytes);
     checkLen(bytes);
@@ -303,15 +429,40 @@ const irohLinkUdpCodec = (() => {
       const version = r.u8();
       if (version !== VERSION) throw codecError("UnsupportedVersion", `unsupported protocol version ${version}`);
       const token = r.take(TOKEN_LEN);
-      frame = { kind: "hello", version, token, bindAddr: r.addr() };
+      const sendBufferSize = r.u32();
+      const receiveBufferSize = r.u32();
+      frame = { kind: "hello", version, token, sendBufferSize, receiveBufferSize };
+      const mode = r.u8();
+      if (mode === MODE_BOUND) {
+        const local = r.addr();
+        const flag = r.u8();
+        if (flag > 2) throw codecError("BadFlag", `bad flag value ${flag}`);
+        Object.assign(frame, {
+          mode: "bound", localAddress: local.address, localPort: local.port,
+          ipv6Only: flag === 0 ? null : flag === 2,
+        });
+      } else if (mode === MODE_CONNECTED) {
+        const dnsQueryType = r.dns();
+        const remoteAddress = r.host();
+        Object.assign(frame, { mode: "connected", remoteAddress, remotePort: r.u16(), dnsQueryType });
+      } else {
+        throw codecError("UnknownMode", `unknown mode ${mode}`);
+      }
     } else if (kind === KIND_BOUND) {
       const local = r.addr();
+      const flag = r.u8();
+      if (flag > 1) throw codecError("BadFlag", `bad flag value ${flag}`);
+      const remote = flag === 1 ? r.addr() : null;
       const maxGsoSegments = r.u16();
       const groSegments = r.u16();
       const n = r.u8();
       const interfaceAddrs = [];
       for (let i = 0; i < n; i++) interfaceAddrs.push(r.addr());
-      frame = { kind: "bound", local, maxGsoSegments, groSegments, interfaceAddrs };
+      frame = {
+        kind: "bound", localAddress: local.address, localPort: local.port,
+        remoteAddress: remote ? remote.address : null, remotePort: remote ? remote.port : null,
+        maxGsoSegments, groSegments, interfaceAddrs,
+      };
     } else if (kind === KIND_ERROR) {
       const code = r.u8();
       if (!ERROR_CODES[code]) throw codecError("UnknownErrorCode", `unknown error code ${code}`);
@@ -320,10 +471,10 @@ const irohLinkUdpCodec = (() => {
       try {
         message = utf8Dec.decode(raw);
       } catch {
-        throw codecError("InvalidUtf8", "error message is not valid utf-8");
+        throw codecError("InvalidUtf8", "string is not valid utf-8");
       }
       frame = { kind: "error", code, codeName: ERROR_CODES[code], message };
-    } else if (kind === KIND_DATA) {
+    } else if (kind === KIND_DATA || kind === KIND_DATA_NAMED) {
       throw codecError("UnexpectedKind", `unexpected kind 0x${kind.toString(16)}`);
     } else {
       throw codecError("UnknownKind", `unknown kind 0x${kind.toString(16)}`);
@@ -332,10 +483,11 @@ const irohLinkUdpCodec = (() => {
     return frame;
   }
 
-  // Decodes a message of DATA records. Returns an array of
+  // Decodes a message of DATA and DATA_NAMED records. Returns an array of
   //   { ecn, address, port, segmentSize, payload }
-  // where payload is a zero-copy subarray of the input. Throws on any
-  // malformed record.
+  // where payload is a zero-copy subarray of the input. DATA_NAMED records
+  // (only sent by pages) carry a host name in `address` and an extra
+  // `dnsQueryType` (null, "ipv4" or "ipv6"). Throws on any malformed record.
   function decodeData(bytes) {
     bytes = toBytes(bytes);
     checkLen(bytes);
@@ -343,7 +495,7 @@ const irohLinkUdpCodec = (() => {
     const out = [];
     while (r.remaining > 0) {
       const kind = r.u8();
-      if (kind !== KIND_DATA) {
+      if (kind !== KIND_DATA && kind !== KIND_DATA_NAMED) {
         if (kind === KIND_HELLO || kind === KIND_BOUND || kind === KIND_ERROR) {
           throw codecError("UnexpectedKind", `unexpected kind 0x${kind.toString(16)}`);
         }
@@ -351,10 +503,19 @@ const irohLinkUdpCodec = (() => {
       }
       const ecn = r.u8();
       if (ecn > 3) throw codecError("BadEcn", `bad ecn value ${ecn}`);
-      const { address, port } = r.addr();
-      const segmentSize = r.u16();
-      const payload = r.take(r.u32());
-      out.push({ ecn, address, port, segmentSize, payload });
+      if (kind === KIND_DATA) {
+        const { address, port } = r.addr();
+        const segmentSize = r.u16();
+        const payload = r.take(r.u32());
+        out.push({ ecn, address, port, segmentSize, payload });
+      } else {
+        const dnsQueryType = r.dns();
+        const address = r.host();
+        const port = r.u16();
+        const segmentSize = r.u16();
+        const payload = r.take(r.u32());
+        out.push({ ecn, address, port, dnsQueryType, segmentSize, payload });
+      }
     }
     return out;
   }
@@ -372,20 +533,20 @@ const irohLinkUdpCodec = (() => {
 
   return {
     VERSION, MAX_MESSAGE_LEN, TOKEN_LEN, WS_PATH,
-    KIND_HELLO, KIND_BOUND, KIND_ERROR, KIND_DATA,
+    KIND_HELLO, KIND_BOUND, KIND_ERROR, KIND_DATA, KIND_DATA_NAMED, MAX_HOST_LEN,
     ERROR_CODES, CLOSE_CODES,
     encodeHello, encodeBound, encodeError, encodeData,
     messageKind, decodeFirst, decodeData, splitSegments,
-    formatIpv6, parseIpv6,
+    formatIpv6, parseIpv6, ipLiteral,
   };
 })();
-// @@iroh-link-udp-codec-module-exports@@
+// @@webview-sockets-codec-module-exports@@
 export const {
   VERSION, MAX_MESSAGE_LEN, TOKEN_LEN, WS_PATH,
-  KIND_HELLO, KIND_BOUND, KIND_ERROR, KIND_DATA,
+  KIND_HELLO, KIND_BOUND, KIND_ERROR, KIND_DATA, KIND_DATA_NAMED, MAX_HOST_LEN,
   ERROR_CODES, CLOSE_CODES,
   encodeHello, encodeBound, encodeError, encodeData,
   messageKind, decodeFirst, decodeData, splitSegments,
-  formatIpv6, parseIpv6,
-} = irohLinkUdpCodec;
-export default irohLinkUdpCodec;
+  formatIpv6, parseIpv6, ipLiteral,
+} = webviewSocketsCodec;
+export default webviewSocketsCodec;

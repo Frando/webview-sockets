@@ -1,4 +1,4 @@
-//! Native UDP echo server and client for testing the iroh-link UDP demo page.
+//! Native UDP echo server and client for testing the webview-sockets UDP demo page.
 //!
 //! `udp-echo listen [--port N]` binds a socket, prints its addresses and echoes
 //! every datagram back to its sender. `udp-echo send <addr> <text>` sends one
@@ -20,7 +20,7 @@ const PRINT_FIRST: u64 = 20;
 /// Interval between count lines after the first datagrams.
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// UDP echo tool for the iroh-link UDP demo.
+/// UDP echo tool for the webview-sockets UDP demo.
 #[derive(Parser, Debug)]
 #[command(name = "udp-echo")]
 struct Cli {

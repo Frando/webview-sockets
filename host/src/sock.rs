@@ -13,8 +13,17 @@ use tokio::io::Interest;
 /// minus headers, rounded down).
 const MAX_GSO_BYTES: usize = 65000;
 
-/// Requested kernel socket buffer size.
-const SOCKET_BUFFER: usize = 2 * 1024 * 1024;
+/// Options for [`Sock::bind`].
+#[derive(Debug, Clone)]
+pub(crate) struct SockOptions {
+    /// `IPV6_V6ONLY` for a `[::]` bind; `None` means dual stack where the OS
+    /// allows it.
+    pub(crate) ipv6_only: Option<bool>,
+    /// Requested kernel send buffer size, best effort.
+    pub(crate) send_buffer: usize,
+    /// Requested kernel receive buffer size, best effort.
+    pub(crate) recv_buffer: usize,
+}
 
 /// A bound UDP socket.
 #[derive(Debug)]
@@ -26,15 +35,18 @@ pub(crate) struct Sock {
 
 impl Sock {
     /// Binds a socket. `[::]` is bound dual-stack where the OS allows it.
-    pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
+    pub(crate) fn bind(addr: SocketAddr, opts: &SockOptions) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         if addr.is_ipv6() && addr.ip().is_unspecified() {
-            // Best effort: some systems do not allow dual-stack sockets.
-            socket.set_only_v6(false).ok();
+            match opts.ipv6_only {
+                Some(only) => socket.set_only_v6(only)?,
+                // Best effort: some systems do not allow dual-stack sockets.
+                None => socket.set_only_v6(false).unwrap_or_default(),
+            }
         }
         // Best effort, capped by the OS (rmem_max/wmem_max on Linux).
-        socket.set_recv_buffer_size(SOCKET_BUFFER).ok();
-        socket.set_send_buffer_size(SOCKET_BUFFER).ok();
+        socket.set_recv_buffer_size(opts.recv_buffer).ok();
+        socket.set_send_buffer_size(opts.send_buffer).ok();
         socket.bind(&addr.into())?;
         socket.set_nonblocking(true)?;
         let std: std::net::UdpSocket = socket.into();
@@ -141,6 +153,19 @@ impl Sock {
             self.state.recv((&self.io).into(), bufs, meta)
         })
     }
+}
+
+/// Returns the local IP the OS would use to reach `remote`.
+///
+/// Connects a throwaway UDP socket, which sends nothing.
+pub(crate) fn route_local_ip(remote: SocketAddr) -> io::Result<IpAddr> {
+    let any: SocketAddr = match remote {
+        SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let probe = std::net::UdpSocket::bind(any)?;
+    probe.connect(remote)?;
+    Ok(probe.local_addr()?.ip())
 }
 
 /// Returns the non-loopback interface addresses with the port of `local`.

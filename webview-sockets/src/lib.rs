@@ -1,14 +1,14 @@
 //! A UDP socket shaped like [`std::net::UdpSocket`] that also works in web
-//! pages opened in iroh-link.
+//! pages, when the app showing them in a webview provides webview-sockets.
 //!
 //! There are three backends, chosen at compile time:
 //!
 //! - Native (everything except `wasm32-unknown-unknown`): a thin wrapper
 //!   around [`std::net::UdpSocket`].
-//! - `wasm32-unknown-unknown` with `--cfg wasm_native_udp`: the socket lives
-//!   in the iroh-link app. The page asks `window.irohHost.udp.requestSession()`
+//! - `wasm32-unknown-unknown` with `--cfg webview_sockets`: the socket lives
+//!   in the host app. The page asks `window.webviewSockets.requestSession()`
 //!   for a session (see [`init`]) and every socket opens one WebSocket to the
-//!   host, speaking the `iroh-link-udp-proto` wire format.
+//!   host, speaking the `webview-sockets-proto` wire format.
 //! - `wasm32-unknown-unknown` without the cfg: every call fails with
 //!   [`io::ErrorKind::Unsupported`].
 //!
@@ -25,12 +25,17 @@
 //! the requested address and sends are queued. [`UdpSocket::bound`] waits for
 //! the confirmation.
 //!
+//! [`UdpSocket::connect_host`] opens a socket connected to a host name, which
+//! the host app resolves (the connected mode of the Direct Sockets
+//! `UDPSocket`). Until the host confirms, [`UdpSocket::send`] returns
+//! [`io::ErrorKind::WouldBlock`] and [`UdpSocket::peer_addr`] fails.
+//!
 //! Errors map as follows: the user or host denied access, or the host closed
 //! the WebSocket because access was revoked (close code 4001) or the UDP
 //! setting was switched off (4002) -> [`io::ErrorKind::PermissionDenied`];
 //! any other WebSocket close -> [`io::ErrorKind::ConnectionAborted`]; a bad
-//! address ->
-//! [`io::ErrorKind::InvalidInput`], no `window.irohHost` ->
+//! address -> [`io::ErrorKind::InvalidInput`]; a host name that does not
+//! resolve -> [`io::ErrorKind::NotFound`]; no `window.webviewSockets` ->
 //! [`io::ErrorKind::Unsupported`].
 //!
 //! # GSO and GRO
@@ -50,18 +55,19 @@ use std::time::Duration;
 #[path = "native.rs"]
 mod imp;
 
-#[cfg(all(wasm_browser, wasm_native_udp))]
+#[cfg(all(wasm_browser, webview_sockets))]
 #[path = "host.rs"]
 mod imp;
 
-#[cfg(all(wasm_browser, not(wasm_native_udp)))]
+#[cfg(all(wasm_browser, not(webview_sockets)))]
 #[path = "unsupported.rs"]
 mod imp;
 
-/// Asks the iroh-link app for a UDP session.
+/// Asks the host app for a UDP session.
 ///
-/// On wasm with `wasm_native_udp` this calls
-/// `window.irohHost.udp.requestSession()`, which may show a permission prompt.
+/// On wasm with `webview_sockets` this calls
+/// `window.webviewSockets.requestSession()`, which may show a permission
+/// prompt.
 /// It must succeed before [`UdpSocket::bind`]. Calling it again requests a new
 /// session. In a Worker, use [`init_with_session`] instead.
 ///
@@ -82,10 +88,20 @@ pub async fn init_with_session(url: &str, token: &str) -> io::Result<()> {
 
 /// Returns whether UDP sockets can work in this environment.
 ///
-/// True on native. On wasm with `wasm_native_udp`, true if
-/// `window.irohHost.udp` exists or a session was set. False otherwise.
+/// True on native. On wasm with `webview_sockets`, true if
+/// `window.webviewSockets` exists or a session was set. False otherwise.
 pub fn is_available() -> bool {
     imp::is_available()
+}
+
+/// Which address family a host name resolves to, see
+/// [`UdpSocket::connect_host`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsQueryType {
+    /// Only IPv4 addresses.
+    Ipv4,
+    /// Only IPv6 addresses.
+    Ipv6,
 }
 
 /// A UDP socket.
@@ -113,6 +129,19 @@ impl UdpSocket {
         Err(last.unwrap_or_else(no_addr))
     }
 
+    /// Creates a UDP socket connected to `host:port`.
+    ///
+    /// `host` is a host name or an IP address literal. `dns` restricts the
+    /// address family it resolves to; `None` takes the first address.
+    ///
+    /// On native this resolves the name, binds an ephemeral port of the
+    /// matching family and connects. On wasm the host app resolves the name
+    /// and only exchanges datagrams with the resolved peer; the call returns
+    /// before that, see [`UdpSocket::bound`].
+    pub fn connect_host(host: &str, port: u16, dns: Option<DnsQueryType>) -> io::Result<Self> {
+        imp::Socket::connect_host(host, port, dns).map(|inner| Self { inner })
+    }
+
     /// Waits until the host confirmed the bind.
     ///
     /// Returns at once on native. On wasm it fails if the host refused the
@@ -138,6 +167,9 @@ impl UdpSocket {
     }
 
     /// Returns the address of the connected peer.
+    ///
+    /// For [`UdpSocket::connect_host`] on wasm this is the resolved address,
+    /// known after [`UdpSocket::bound`].
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.inner.peer_addr()
     }

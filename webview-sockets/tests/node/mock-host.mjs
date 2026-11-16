@@ -1,4 +1,4 @@
-// Mock iroh-link UDP host plus a UDP echo server, used to run the wasm shim
+// Mock webview-sockets host plus a UDP echo server, used to run the wasm shim
 // under Node (Node >= 22 has a global WebSocket client).
 //
 // Usage: node mock-host.mjs <path to wasm-bindgen --target nodejs output .js>
@@ -6,6 +6,8 @@
 // Behaviour of the mock host:
 // - token must be TOKEN, else ERROR NotAllowed.
 // - bind port 1 -> ERROR AddrInUse.
+// - connected mode: resolves the name with node:dns (ipv4 only), ERROR
+//   NameNotResolved if that fails; BOUND reports the remote address.
 // - BOUND reports maxGsoSegments = groSegments = 4.
 // - sends to port 9 -> ERROR InvalidInput (socket stays open); to port 7 are
 //   dropped (sink).
@@ -18,11 +20,12 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import dgram from "node:dgram";
+import dns from "node:dns/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const codec = (await import(path.join(here, "../../../udp-proto/js/codec.js"))).default;
+const codec = (await import(path.join(here, "../../../proto/js/codec.js"))).default;
 
 const TOKEN = "ab".repeat(32);
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -128,6 +131,7 @@ function wsClose(conn, code) {
 
 function session(conn) {
   let udp = null;
+  let remote = null;
   let pending = [];
   conn.onclose = () => udp?.close();
   conn.onmessage = (msg) => {
@@ -139,28 +143,46 @@ function session(conn) {
         wsClose(conn, 1000);
         return;
       }
-      if (hello.bindAddr.port === 1) {
+      if (hello.mode === "bound" && hello.localPort === 1) {
         wsSend(conn, codec.encodeError("AddrInUse", "port 1 in use"));
         wsClose(conn, 1000);
         return;
       }
       udp = dgram.createSocket("udp4");
       udp.on("message", (data, rinfo) => {
+        if (remote && (rinfo.address !== remote.address || rinfo.port !== remote.port)) return;
         pending.push({ address: rinfo.address, port: rinfo.port, data });
         if (pending.length === 1) setImmediate(flushRecv);
       });
-      udp.bind(hello.bindAddr.port, hello.bindAddr.address, () => {
+      const bound = () => {
         const local = udp.address();
         wsSend(
           conn,
           codec.encodeBound({
-            local: { address: local.address, port: local.port },
+            localAddress: local.address,
+            localPort: local.port,
+            remoteAddress: remote?.address ?? null,
+            remotePort: remote?.port ?? null,
             maxGsoSegments: 4,
             groSegments: 4,
             interfaceAddrs: [{ address: "127.0.0.1", port: local.port }],
           }),
         );
-      });
+      };
+      if (hello.mode === "connected") {
+        dns.lookup(hello.remoteAddress, { family: 4 }).then(
+          ({ address }) => {
+            remote = { address, port: hello.remotePort };
+            udp.bind(0, "127.0.0.1", bound);
+          },
+          () => {
+            wsSend(conn, codec.encodeError("NameNotResolved", `cannot resolve ${hello.remoteAddress}`));
+            wsClose(conn, 1000);
+          },
+        );
+      } else {
+        udp.bind(hello.localPort, hello.localAddress, bound);
+      }
       return;
     }
     for (const rec of codec.decodeData(msg)) {
@@ -254,12 +276,10 @@ function check(name, got, want) {
   console.log(`${ok ? "ok  " : "FAIL"} ${name}: ${got}${ok ? "" : ` (want ${want})`}`);
 }
 
-check("init without irohHost", await shim.init_kind(), "Unsupported");
-globalThis.irohHost = {
-  udp: {
-    requestSession: async () => {
-      throw new DOMException("blocked", "NotAllowedError");
-    },
+check("init without webviewSockets", await shim.init_kind(), "Unsupported");
+globalThis.webviewSockets = {
+  requestSession: async () => {
+    throw new DOMException("blocked", "NotAllowedError");
   },
 };
 check("init denied", await shim.init_kind(), "PermissionDenied");
@@ -269,12 +289,18 @@ check("addr in use", await shim.bind_kind(url, TOKEN, "0.0.0.0:1"), "AddrInUse")
 const deadUrl = `ws://127.0.0.1:1${codec.WS_PATH}`;
 check("host unreachable", await shim.bind_kind(deadUrl, TOKEN, "0.0.0.0:0"), "ConnectionAborted");
 
-globalThis.irohHost = { udp: { requestSession: async () => ({ url, token: TOKEN }) } };
+globalThis.webviewSockets = { requestSession: async () => ({ url, token: TOKEN }) };
 try {
   console.log(`ok   run: ${await shim.run(echoAddr)}`);
 } catch (e) {
   failed = true;
   console.log(`FAIL run: ${e}`);
+}
+{
+  const echoPort = echo.address().port;
+  const got = await shim.connect_host("localhost", echoPort).catch((e) => `error ${e}`);
+  check("connect_host by name", got, `ok 127.0.0.1:${echoPort}`);
+  check("connect_host unresolvable", await shim.connect_host("nx.invalid", echoPort), "NotFound");
 }
 for (const [payload, want] of [
   ["close-me", "PermissionDenied"],

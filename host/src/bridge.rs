@@ -4,22 +4,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::SessionTicket;
 
-/// A request from the injected script: `{"id": 1, "op": "requestSession"}`.
+/// A request from the injected script:
+/// `{"ns": "webview-sockets", "id": 1, "op": "requestSession"}`.
+///
+/// The `ns` field lets an app share one IPC channel (e.g. wry's
+/// `window.ipc.postMessage`) between webview-sockets and its own messages.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BridgeRequest {
     /// Request id, echoed in the reply.
     pub id: u64,
-    /// Operation; v1 only knows `"requestSession"`.
+    /// Operation; only `"requestSession"` exists.
     pub op: String,
 }
 
+#[derive(Deserialize)]
+struct Envelope {
+    ns: String,
+    #[serde(flatten)]
+    request: BridgeRequest,
+}
+
 impl BridgeRequest {
-    /// The only operation in v1.
+    /// Value of the `ns` field of every bridge request.
+    pub const NAMESPACE: &'static str = "webview-sockets";
+
+    /// Asks for a session ticket.
     pub const OP_REQUEST_SESSION: &'static str = "requestSession";
 
-    /// Parses a bridge message, returning `None` if it is malformed.
+    /// Parses a bridge message.
+    ///
+    /// Returns `None` if it is malformed or not in the webview-sockets
+    /// namespace, so apps can try their own message types next.
     pub fn parse(json: &str) -> Option<Self> {
-        serde_json::from_str(json).ok()
+        let env: Envelope = serde_json::from_str(json).ok()?;
+        (env.ns == Self::NAMESPACE).then_some(env.request)
     }
 }
 
@@ -65,10 +83,13 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let req = BridgeRequest::parse(r#"{"id":7,"op":"requestSession"}"#).unwrap();
+        let req = BridgeRequest::parse(r#"{"ns":"webview-sockets","id":7,"op":"requestSession"}"#)
+            .unwrap();
         assert_eq!(req.id, 7);
         assert_eq!(req.op, BridgeRequest::OP_REQUEST_SESSION);
         assert!(BridgeRequest::parse("{}").is_none());
+        assert!(BridgeRequest::parse(r#"{"id":7,"op":"requestSession"}"#).is_none());
+        assert!(BridgeRequest::parse(r#"{"ns":"app","id":7,"op":"requestSession"}"#).is_none());
         let t = SessionTicket {
             url: "ws://a/x".into(),
             token: "ab".into(),

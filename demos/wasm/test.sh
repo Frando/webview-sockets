@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test of the wasm demo in headless Chrome against the
-# iroh-link-udp-host test-host and udp-echo. Run ./build.sh first.
+# webview-sockets-host test-host and udp-echo. Run ./build.sh first.
 #
 #   ./test.sh [--bench]
 set -euo pipefail
@@ -8,15 +8,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 host_port=47931
 echo_port=47932
-run="$repo/udp-host/examples/test-page/run-chrome.mjs"
-[ -f "$here/public/wasm/iroh_link_udp_demo_wasm_bg.wasm" ] || { echo "run ./build.sh first" >&2; exit 1; }
+run="$repo/host/examples/test-page/run-chrome.mjs"
+[ -f "$here/public/wasm/webview_sockets_demo_wasm_bg.wasm" ] || { echo "run ./build.sh first" >&2; exit 1; }
 
-(cd "$repo/iroh-link-udp-demo" && cargo build -q)
-(cd "$repo" && cargo build -q -p iroh-link-udp-host --example test-host)
-echo_bin="$(cd "$repo/iroh-link-udp-demo" && cargo metadata --format-version 1 --no-deps | node -e \
-  'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).target_directory))')/debug/udp-echo"
-host_bin="$(cd "$repo" && cargo metadata --format-version 1 --no-deps | node -e \
-  'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).target_directory))')/debug/examples/test-host"
+(cd "$repo" && cargo build -q -p webview-sockets-demo && cargo build -q -p webview-sockets-host --example test-host)
+target_dir="$(cd "$repo" && cargo metadata --format-version 1 --no-deps | node -e \
+  'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).target_directory))')"
+echo_bin="$target_dir/debug/udp-echo"
+host_bin="$target_dir/debug/examples/test-host"
 
 "$echo_bin" listen --port "$echo_port" --bind :: >/dev/null &
 pids=($!)
@@ -25,7 +24,7 @@ pids+=($!)
 trap 'kill "${pids[@]}" 2>/dev/null' EXIT
 sleep 1
 
-base="http://test.pkarr.localhost:$host_port/"
+base="http://test.localhost:$host_port/"
 fail=0
 check() { # want(PASS|FAIL) query
   local out

@@ -6,7 +6,7 @@
 <style>body { font-family: monospace; margin: 1em; } pre { white-space: pre-wrap; }</style>
 </head>
 <body>
-<h1>irohHost.udp self test</h1>
+<h1>webviewSockets.udp self test</h1>
 <p>Binds two sockets, sends a datagram and a GSO batch from one to the other,
 and checks the results. Optional: <code>?peer=ip:port&amp;send=text&amp;expect=text</code>
 also sends to an external echo server. Result in the title:
@@ -36,19 +36,19 @@ also sends to an external echo server. Result in the title:
     };
   });
   try {
-    if (!window.irohHost) {
+    if (!window.webviewSockets) {
       await new Promise((resolve, reject) => {
         const s = document.createElement("script");
-        s.src = "/.well-known/iroh-link/host.js";
+        s.src = "/.well-known/webview-sockets/polyfill.js";
         s.onload = resolve;
         s.onerror = () => reject(new Error("could not load host.js"));
         document.head.appendChild(s);
       });
     }
-    if (!window.irohHost) throw new Error("window.irohHost missing (not a gateway origin?)");
+    if (!window.webviewSockets) throw new Error("window.webviewSockets missing (not served by a webview-sockets host?)");
     const dec = new TextDecoder();
-    const a = await irohHost.udp.bind();
-    const b = await irohHost.udp.bind({ address: "127.0.0.1" });
+    const a = await webviewSockets.udp.bind();
+    const b = await webviewSockets.udp.bind({ address: "127.0.0.1" });
     log(`a: ${a.localAddress}:${a.localPort} gso=${a.maxGsoSegments} gro=${a.groSegments}`,
       `ifaces=${JSON.stringify(a.interfaceAddrs)}`);
     log(`b: ${b.localAddress}:${b.localPort}`);

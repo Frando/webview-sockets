@@ -1,6 +1,6 @@
 [package]
-name = "wasm-native-udp"
-description = "A UdpSocket shaped like std::net::UdpSocket that also works in iroh-link web pages"
+name = "webview-sockets"
+description = "A UdpSocket shaped like std::net::UdpSocket that also works in webview pages"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-iroh-link-udp-proto = { path = "../udp-proto" }
+webview-sockets-proto = { path = "../proto" }
 js-sys = "0.3.105"
 tracing = { workspace = true }
 wasm-bindgen = "0.2.128"
@@ -23,6 +23,11 @@ web-sys = { version = "0.3.105", features = [
     "Url",
     "WebSocket",
 ] }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+# Pinned for the node test: tests/node/run.sh runs the wasm-bindgen CLI of
+# exactly this version. Dev dependencies do not constrain users.
+wasm-bindgen = "=0.2.128"
 
 [[example]]
 name = "node_test"

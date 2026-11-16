@@ -1,16 +1,16 @@
-//! Dev server for pages using `window.irohHost.udp` without an app.
+//! Dev server for pages using `window.webviewSockets.udp` without an app.
 //!
 //! Serves a directory on 127.0.0.1 for any Host, mounts the UDP route, and
-//! serves the injected script at `/.well-known/iroh-link/host.js` with a dev
-//! adapter that gets sessions from `/.well-known/iroh-link/dev-session`.
-//! Pages load it when `window.irohHost` is missing:
+//! serves the injected script at `/.well-known/webview-sockets/polyfill.js` with a dev
+//! adapter that gets sessions from `/.well-known/webview-sockets/dev-session`.
+//! Pages load it when `window.webviewSockets` is missing:
 //!
 //! ```html
-//! <script src="/.well-known/iroh-link/host.js"></script>
+//! <script src="/.well-known/webview-sockets/polyfill.js"></script>
 //! ```
 //!
-//! Run: `cargo run -p iroh-link-udp-host --example test-host -- --dir <dir>
-//! [--port N] [--auto-grant]` and open `http://test.pkarr.localhost:<port>/`.
+//! Run: `cargo run -p webview-sockets-host --example test-host -- --dir <dir>
+//! [--port N] [--auto-grant]` and open `http://test.localhost:<port>/`.
 
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -22,23 +22,24 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use iroh_link_udp_host::{
-    Choice, Decision, INJECTED_JS, SessionTicket, TabId, UdpHost, UdpHostConfig, bridge_reply,
-};
 use n0_error::{Result, StdResultExt};
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
+use webview_sockets_host::{
+    Choice, Decision, HostPolicy, INJECTED_JS, SessionTicket, TabId, UdpHost, UdpHostConfig,
+    bridge_reply,
+};
 
 /// Prepended to the injected script: asks this server for a session when
 /// the page has no platform bridge.
-const DEV_ADAPTER: &str = r#"window.__irohHostDevSession = async () => {
-  const r = await fetch("/.well-known/iroh-link/dev-session", { method: "POST" });
+const DEV_ADAPTER: &str = r#"window.__webviewSocketsDevSession = async () => {
+  const r = await fetch("/.well-known/webview-sockets/dev-session", { method: "POST" });
   return await r.json();
 };
 "#;
 
 #[derive(Parser, Debug)]
-#[command(about = "Serve a directory with the iroh-link UDP host for testing")]
+#[command(about = "Serve a directory with the webview-sockets host for testing")]
 struct Args {
     /// Directory to serve.
     #[arg(long)]
@@ -52,7 +53,7 @@ struct Args {
     /// Grant store file (default: a fresh file in the temp dir).
     #[arg(long)]
     store: Option<PathBuf>,
-    /// Accept any Host, not only `<label>.(blake3|pkarr).localhost:<port>`.
+    /// Accept any Host, not only `<name>.localhost:<port>`.
     #[arg(long)]
     any_host: bool,
 }
@@ -68,16 +69,26 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh_link_udp_host=debug".into()),
+                .unwrap_or_else(|_| "info,webview_sockets_host=debug".into()),
         )
         .init();
     let args = Args::parse();
     let store = args.store.unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("iroh-link-test-host-{}.json", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "webview-sockets-test-host-{}.json",
+            std::process::id()
+        ))
     });
-    let mut config = UdpHostConfig::new(&store);
-    config.check_host = !args.any_host;
-    let host = UdpHost::new(config)?;
+    let policy = if args.any_host {
+        HostPolicy::Any
+    } else {
+        HostPolicy::from_fn(|host| {
+            host.rsplit_once(':').is_some_and(|(name, port)| {
+                name.ends_with(".localhost") && port.parse::<u16>().is_ok()
+            })
+        })
+    };
+    let host = UdpHost::new(UdpHostConfig::new(&store, policy))?;
     host.set_enabled(true);
 
     let state = AppState {
@@ -85,8 +96,11 @@ async fn main() -> Result<()> {
         auto_grant: args.auto_grant,
     };
     let app = Router::new()
-        .route("/.well-known/iroh-link/host.js", get(host_js))
-        .route("/.well-known/iroh-link/dev-session", post(dev_session))
+        .route("/.well-known/webview-sockets/polyfill.js", get(host_js))
+        .route(
+            "/.well-known/webview-sockets/dev-session",
+            post(dev_session),
+        )
         .with_state(state)
         .merge(host.router())
         .fallback_service(ServeDir::new(&args.dir));
@@ -97,7 +111,7 @@ async fn main() -> Result<()> {
     let port = listener.local_addr().std_context("local addr")?.port();
     info!(dir = %args.dir.display(), store = %store.display(), auto_grant = args.auto_grant, "serving");
     println!("test-host listening on 127.0.0.1:{port}");
-    println!("open http://test.pkarr.localhost:{port}/");
+    println!("open http://test.localhost:{port}/");
     axum::serve(listener, app).await.std_context("serve")?;
     Ok(())
 }

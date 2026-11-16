@@ -1,15 +1,15 @@
 //! End-to-end checks of the host backend, run under Node against a mock host.
 //!
-//! Build for `wasm32-unknown-unknown` with `--cfg wasm_native_udp` and run
+//! Build for `wasm32-unknown-unknown` with `--cfg webview_sockets` and run
 //! `tests/node/run.sh`. On other targets this example is empty.
 
-#[cfg(all(wasm_browser, wasm_native_udp))]
+#[cfg(all(wasm_browser, webview_sockets))]
 mod imp {
     use std::io;
     use std::net::SocketAddr;
 
     use wasm_bindgen::prelude::*;
-    use wasm_native_udp::UdpSocket;
+    use webview_sockets::UdpSocket;
 
     fn fail(ctx: &str, err: impl std::fmt::Display) -> JsValue {
         JsValue::from_str(&format!("{ctx}: {err}"))
@@ -36,7 +36,7 @@ mod imp {
     /// Calls `init()` and returns `"ok"` or the error kind.
     #[wasm_bindgen]
     pub async fn init_kind() -> String {
-        match wasm_native_udp::init().await {
+        match webview_sockets::init().await {
             Ok(()) => "ok".into(),
             Err(err) => format!("{:?}", err.kind()),
         }
@@ -46,7 +46,7 @@ mod imp {
     #[wasm_bindgen]
     pub async fn bind_kind(url: String, token: String, addr: String) -> String {
         let res = async {
-            wasm_native_udp::init_with_session(&url, &token).await?;
+            webview_sockets::init_with_session(&url, &token).await?;
             let sock = UdpSocket::bind(addr.as_str())?;
             sock.bound().await
         };
@@ -58,11 +58,11 @@ mod imp {
 
     /// Runs the main scenario against the UDP echo server at `echo`.
     ///
-    /// Expects `init()` to succeed (the caller installs `irohHost`).
+    /// Expects `init()` to succeed (the caller installs `webviewSockets`).
     #[wasm_bindgen]
     pub async fn run(echo: String) -> Result<String, JsValue> {
         let echo: SocketAddr = echo.parse().map_err(|e| fail("echo addr", e))?;
-        wasm_native_udp::init().await.map_err(|e| fail("init", e))?;
+        webview_sockets::init().await.map_err(|e| fail("init", e))?;
         let mut report = Vec::new();
 
         // Bind is sync; sends queue until BOUND.
@@ -202,14 +202,38 @@ mod imp {
         }
     }
 
+    /// Opens a socket connected to `host:port` and checks a round trip.
+    ///
+    /// Returns `"ok <peer>"` or the error kind of the open.
+    #[wasm_bindgen]
+    pub async fn connect_host(host: String, port: u16) -> Result<String, JsValue> {
+        webview_sockets::init().await.map_err(|e| fail("init", e))?;
+        let sock = UdpSocket::connect_host(&host, port, Some(webview_sockets::DnsQueryType::Ipv4))
+            .map_err(|e| fail("connect_host", e))?;
+        // Before BOUND the peer is unknown and sends would block.
+        ensure(
+            sock.send(b"x").map_err(|e| e.kind()) == Err(io::ErrorKind::WouldBlock),
+            "send before bound",
+        )?;
+        if let Err(err) = sock.bound().await {
+            return Ok(format!("{:?}", err.kind()));
+        }
+        let peer = sock.peer_addr().map_err(|e| fail("peer_addr", e))?;
+        ensure(peer.port() == port, "peer port")?;
+        sock.send(b"named").map_err(|e| fail("send", e))?;
+        let (data, from) = recv(&sock).await?;
+        ensure(data == b"named" && from == peer, "connected echo")?;
+        Ok(format!("ok {peer}"))
+    }
+
     /// Binds a fresh socket, sends `payload` to `echo` so the mock host closes
     /// the connection, and returns the resulting error kind.
     ///
-    /// Expects `init()` to succeed (the caller installs `irohHost`).
+    /// Expects `init()` to succeed (the caller installs `webviewSockets`).
     #[wasm_bindgen]
     pub async fn close_kind(echo: String, payload: String) -> Result<String, JsValue> {
         let echo: SocketAddr = echo.parse().map_err(|e| fail("echo addr", e))?;
-        wasm_native_udp::init().await.map_err(|e| fail("init", e))?;
+        webview_sockets::init().await.map_err(|e| fail("init", e))?;
         let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
         sock.bound().await.map_err(|e| fail("bound", e))?;
         let err = close_with(&sock, echo, payload.as_bytes()).await;

@@ -1,7 +1,7 @@
 //! Native backend: a thin wrapper around [`std::net::UdpSocket`].
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 pub(crate) async fn init() -> io::Result<()> {
@@ -22,6 +22,34 @@ pub(crate) struct Socket(std::net::UdpSocket);
 impl Socket {
     pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
         std::net::UdpSocket::bind(addr).map(Self)
+    }
+
+    pub(crate) fn connect_host(
+        host: &str,
+        port: u16,
+        dns: Option<crate::DnsQueryType>,
+    ) -> io::Result<Self> {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let remote = (host, port)
+            .to_socket_addrs()?
+            .find(|a| match dns {
+                None => true,
+                Some(crate::DnsQueryType::Ipv4) => a.is_ipv4(),
+                Some(crate::DnsQueryType::Ipv6) => a.is_ipv6(),
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"))
+            })?;
+        let any: SocketAddr = match remote {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let sock = std::net::UdpSocket::bind(any)?;
+        sock.connect(remote)?;
+        Ok(Self(sock))
     }
 
     pub(crate) async fn bound(&self) -> io::Result<()> {

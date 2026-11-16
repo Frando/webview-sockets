@@ -1,21 +1,20 @@
-// iroh-link host API for web pages: native UDP sockets.
+// webview-sockets page API: native UDP sockets.
 //
-// Injected at document start into gateway pages by the Android app and the
-// desktop browser. Defines window.irohHost only in the top frame of a gateway
-// origin (http://<label>.(blake3|pkarr).localhost:<port>).
+// The host app injects this at document start into the pages it serves.
+// Defines window.webviewSockets in the top frame of http(s) pages; the host
+// decides on each request whether the origin may use sockets.
 //
-// window.irohHost.udp.requestSession() -> Promise<{ url, token }>
-// window.irohHost.udp.bind({ address?, port? }) -> Promise<UdpSocketJs>
+// window.webviewSockets.requestSession() -> Promise<{ url, token }>
+// window.webviewSockets.udp.bind({ address?, port? }) -> Promise<UdpSocketJs>
 (() => {
   "use strict";
   if (window !== window.top) return;
-  if (location.protocol !== "http:") return;
-  if (!/^[a-z0-9]+\.(blake3|pkarr)\.localhost$/.test(location.hostname)) return;
-  if (window.irohHost) return;
+  if (location.protocol !== "http:" && location.protocol !== "https:") return;
+  if (window.webviewSockets) return;
 
-  // @@iroh-link-udp-codec@@
+  // @@webview-sockets-codec@@
 
-  const C = irohLinkUdpCodec;
+  const C = webviewSocketsCodec;
 
   // ---- platform bridge ----
 
@@ -38,20 +37,20 @@
     p(reply);
   }
 
-  // Desktop: the host calls window.__irohHostReply(id, json) via evaluate_script.
-  Object.defineProperty(window, "__irohHostReply", {
+  // Desktop: the host calls window.__webviewSocketsReply(id, json) via evaluate_script.
+  Object.defineProperty(window, "__webviewSocketsReply", {
     value: (id, json) => {
       const reply = typeof json === "string" ? JSON.parse(json) : json;
       deliver(Object.assign({}, reply, { id }));
     },
   });
 
-  // Sends {id, op} to the platform and resolves with its reply
-  // {id, ok, url?, token?, error?}.
+  // Sends {ns: "webview-sockets", id, op} to the platform and resolves with
+  // its reply {id, ok, url?, token?, error?}.
   function bridgeCall(op) {
     const id = nextId++;
-    const msg = JSON.stringify({ id, op });
-    const android = window.irohLinkBridge;
+    const msg = JSON.stringify({ ns: "webview-sockets", id, op });
+    const android = window.webviewSocketsBridge;
     if (android && typeof android.postMessage === "function") {
       if (!androidHooked) {
         androidHooked = true;
@@ -73,9 +72,9 @@
         window.ipc.postMessage(msg);
       });
     }
-    if (typeof window.__irohHostDevSession === "function") {
+    if (typeof window.__webviewSocketsDevSession === "function") {
       return Promise.resolve()
-        .then(() => window.__irohHostDevSession())
+        .then(() => window.__webviewSocketsDevSession())
         .then((r) => Object.assign({}, r, { id }), (e) => ({ id, ok: false, error: String(e) }));
     }
     return Promise.resolve({ id, ok: false, error: "NotSupported" });
@@ -90,7 +89,7 @@
     if (!reply.ok) {
       const error = reply.error || "NotAllowed";
       if (error === "NotSupported") {
-        throw domError("no iroh-link host bridge on this page", "NotSupportedError");
+        throw domError("no webview-sockets bridge on this page", "NotSupportedError");
       }
       const message = error === "Disabled" ? "UDP is turned off in the browser settings"
         : `UDP access not allowed (${error})`;
@@ -121,6 +120,7 @@
     AddrInUse: "NetworkError",
     Limit: "QuotaExceededError",
     Io: "NetworkError",
+    NameNotResolved: "NetworkError",
   };
 
   function bindError(frame) {
@@ -135,8 +135,8 @@
       this._queue = [];
       this._queued = 0;
       this._flushScheduled = false;
-      this.localAddress = bound.local.address;
-      this.localPort = bound.local.port;
+      this.localAddress = bound.localAddress;
+      this.localPort = bound.localPort;
       this.interfaceAddrs = bound.interfaceAddrs;
       this.maxGsoSegments = bound.maxGsoSegments;
       this.groSegments = bound.groSegments;
@@ -205,14 +205,14 @@
       if (C.messageKind(bytes) === C.KIND_ERROR) {
         const frame = C.decodeFirst(bytes);
         if (this.onerror) this.onerror({ code: frame.codeName, message: frame.message });
-        else console.warn(`irohHost.udp: ${frame.codeName}: ${frame.message}`);
+        else console.warn(`webviewSockets.udp: ${frame.codeName}: ${frame.message}`);
         return;
       }
       let records;
       try {
         records = C.decodeData(bytes);
       } catch (err) {
-        console.warn("irohHost.udp: bad message from host", err);
+        console.warn("webviewSockets.udp: bad message from host", err);
         this._ws.close(1002);
         return;
       }
@@ -227,8 +227,7 @@
 
   async function bind(opts = {}) {
     const s = await getSession();
-    const bindAddr = { address: opts.address ?? "0.0.0.0", port: opts.port ?? 0 };
-    const hello = C.encodeHello(s.token, bindAddr);
+    const hello = C.encodeHello(s.token, { localAddress: opts.address ?? "0.0.0.0", localPort: opts.port ?? 0 });
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(s.url);
       ws.binaryType = "arraybuffer";
@@ -259,9 +258,9 @@
     });
   }
 
-  const udp = Object.freeze({ requestSession, bind });
-  Object.defineProperty(window, "irohHost", {
-    value: Object.freeze({ version: 1, udp }),
+  const udp = Object.freeze({ bind });
+  Object.defineProperty(window, "webviewSockets", {
+    value: Object.freeze({ version: C.VERSION, requestSession, udp }),
     enumerable: true,
   });
 })();

@@ -13,7 +13,7 @@ use n0_future::time::{Duration, Instant, sleep, timeout};
 use tokio::sync::mpsc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
-use wasm_native_udp::UdpSocket;
+use webview_sockets::UdpSocket;
 
 /// Payload size of the bench datagrams.
 const BENCH_SIZE: usize = 1200;
@@ -65,8 +65,8 @@ pub struct Demo {
 #[wasm_bindgen]
 pub async fn start() -> Result<Demo, JsError> {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
-    wasm_native_udp::init().await.map_err(|e| match e.kind() {
-        io::ErrorKind::Unsupported => js_err(format!("not running in the iroh-link browser ({e})")),
+    webview_sockets::init().await.map_err(|e| match e.kind() {
+        io::ErrorKind::Unsupported => js_err(format!("not running in a webview-sockets host app ({e})")),
         _ => js_err(e),
     })?;
     let mut notes = Vec::new();

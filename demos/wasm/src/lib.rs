@@ -1,7 +1,7 @@
-//! Native UDP demo for iroh-link pages, with all networking in Rust.
+//! Native UDP demo for webview pages, with all networking in Rust.
 //!
-//! Built for `wasm32-unknown-unknown` with `--cfg wasm_native_udp`, the
-//! [`wasm_native_udp::UdpSocket`] talks to the iroh-link host. `public/main.js`
+//! Built for `wasm32-unknown-unknown` with `--cfg webview_sockets`, the
+//! [`webview_sockets::UdpSocket`] talks to the host app. `public/main.js`
 //! only drives the UI and calls the exports of this crate:
 //!
 //! - `start()` asks for a session, binds `[::]:0` (falling back to

@@ -1,5 +1,5 @@
 [package]
-name = "iroh-link-udp-proto"
+name = "webview-sockets-proto"
 description = "Wire format between web pages and the host for native UDP sockets"
 version.workspace = true
 edition.workspace = true

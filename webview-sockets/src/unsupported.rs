@@ -1,4 +1,4 @@
-//! Backend for wasm without `--cfg wasm_native_udp`: nothing works.
+//! Backend for wasm without `--cfg webview_sockets`: nothing works.
 
 use std::convert::Infallible;
 use std::io;
@@ -9,7 +9,7 @@ use std::time::Duration;
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "UDP needs wasm-native-udp built with --cfg wasm_native_udp",
+        "UDP needs webview-sockets built with --cfg webview_sockets",
     )
 }
 
@@ -31,6 +31,14 @@ pub(crate) struct Socket(Infallible);
 
 impl Socket {
     pub(crate) fn bind(_addr: SocketAddr) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn connect_host(
+        _host: &str,
+        _port: u16,
+        _dns: Option<crate::DnsQueryType>,
+    ) -> io::Result<Self> {
         Err(unsupported())
     }
 

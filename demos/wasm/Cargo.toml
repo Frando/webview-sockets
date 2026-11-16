@@ -1,6 +1,6 @@
 [package]
-name = "iroh-link-udp-demo-wasm"
-description = "Native UDP demo for iroh-link pages, written in Rust on wasm-native-udp"
+name = "webview-sockets-demo-wasm"
+description = "Native UDP demo for webview pages, written in Rust on webview-sockets"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
@@ -8,14 +8,14 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 # Its own workspace: it builds for wasm32-unknown-unknown with
-# `--cfg wasm_native_udp` (see .cargo/config.toml and build.sh).
+# `--cfg webview_sockets` (see .cargo/config.toml and build.sh).
 [workspace]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wasm-native-udp = { path = "../../wasm-native-udp" }
+webview-sockets = { path = "../../webview-sockets" }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 js-sys = "0.3.105"

@@ -1,10 +1,10 @@
-//! The injected script, assembled at compile time from `js/iroh-host.js` and
+//! The injected script, assembled at compile time from `js/webview-sockets.js` and
 //! the proto crate's JS codec.
 
-use iroh_link_udp_proto::{JS_CODEC, JS_CODEC_EXPORT_MARKER};
+use webview_sockets_proto::{JS_CODEC, JS_CODEC_EXPORT_MARKER};
 
-const HOST_JS: &str = include_str!("../js/iroh-host.js");
-const CODEC_MARKER: &str = "// @@iroh-link-udp-codec@@";
+const HOST_JS: &str = include_str!("../js/webview-sockets.js");
+const CODEC_MARKER: &str = "// @@webview-sockets-codec@@";
 
 /// Returns the byte offset of `needle` in `haystack`; fails the build if
 /// it is missing.
@@ -56,14 +56,16 @@ const fn concat() -> [u8; LEN] {
 
 static BYTES: [u8; LEN] = concat();
 
-/// The classic script to inject into gateway pages at document start.
+/// The classic script to inject into the app's pages at document start.
 ///
-/// It defines `window.irohHost` (version 1) with `udp.requestSession()` and
-/// `udp.bind(opts)` only in the top frame of a gateway origin. It talks to
-/// the platform over `window.irohLinkBridge` (Android web message listener)
-/// or `window.ipc.postMessage` (desktop, replies via
-/// `window.__irohHostReply(id, json)`). Pages without either bridge fall
-/// back to `window.__irohHostDevSession()` if defined (dev only).
+/// It defines `window.webviewSockets` (version 2) with `requestSession()`
+/// and `udp.bind(opts)` in the top frame of http(s) pages. It talks to the
+/// platform over `window.webviewSocketsBridge` (Android web message
+/// listener) or `window.ipc.postMessage` (desktop, replies via
+/// `window.__webviewSocketsReply(id, json)`); requests are JSON
+/// `{"ns": "webview-sockets", "id", "op"}`, see [`crate::BridgeRequest`].
+/// Pages without either bridge fall back to
+/// `window.__webviewSocketsDevSession()` if defined (dev only).
 pub const INJECTED_JS: &str = match core::str::from_utf8(&BYTES) {
     Ok(s) => s,
     Err(_) => panic!("injected script is not utf-8"),
@@ -75,7 +77,7 @@ mod tests {
 
     #[test]
     fn assembled() {
-        assert!(INJECTED_JS.contains("const irohLinkUdpCodec"));
+        assert!(INJECTED_JS.contains("const webviewSocketsCodec"));
         assert!(INJECTED_JS.contains("requestSession"));
         assert!(!INJECTED_JS.contains(CODEC_MARKER));
         assert!(!INJECTED_JS.contains("\nexport "));

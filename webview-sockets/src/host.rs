@@ -1,4 +1,4 @@
-//! Host backend: UDP sockets owned by the iroh-link app, reached over one
+//! Host backend: UDP sockets owned by the host app, reached over one
 //! WebSocket per socket.
 //!
 //! JavaScript objects live in a `thread_local!` registry keyed by socket id.
@@ -15,13 +15,13 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use iroh_link_udp_proto as proto;
 use js_sys::{ArrayBuffer, Function, Promise, Reflect, Uint8Array};
 use tracing::{debug, trace, warn};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{BinaryType, CloseEvent, MessageEvent, WebSocket};
+use webview_sockets_proto as proto;
 
 /// Above this many queued bytes sends return `WouldBlock`.
 const HIGH_WATER: usize = 256 * 1024;
@@ -45,7 +45,7 @@ extern "C" {
     fn set_timeout(cb: &Function, ms: i32) -> JsValue;
 }
 
-/// Session from `irohHost.udp.requestSession()`.
+/// Session from `webviewSockets.requestSession()`.
 #[derive(Debug, Clone)]
 struct Session {
     url: String,
@@ -75,23 +75,23 @@ fn ws_of(id: u64) -> Option<WebSocket> {
 }
 
 pub(crate) async fn init() -> io::Result<()> {
-    let udp = host_udp().ok_or_else(|| {
+    let api = host_api().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::Unsupported,
-            "window.irohHost.udp is not available",
+            "window.webviewSockets is not available",
         )
     })?;
-    let request = Reflect::get(&udp, &"requestSession".into())
+    let request = Reflect::get(&api, &"requestSession".into())
         .ok()
         .and_then(|f| f.dyn_into::<Function>().ok())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
-                "irohHost.udp.requestSession is not a function",
+                "webviewSockets.requestSession is not a function",
             )
         })?;
     let promise = request
-        .call0(&udp)
+        .call0(&api)
         .map_err(js_error)?
         .dyn_into::<Promise>()
         .map_err(|_| io::Error::other("requestSession did not return a promise"))?;
@@ -111,16 +111,13 @@ pub(crate) fn init_with_session(url: &str, token: &str) -> io::Result<()> {
 }
 
 pub(crate) fn is_available() -> bool {
-    SESSION.lock().expect("poisoned").is_some() || host_udp().is_some()
+    SESSION.lock().expect("poisoned").is_some() || host_api().is_some()
 }
 
-fn host_udp() -> Option<JsValue> {
-    let host = Reflect::get(&js_sys::global(), &"irohHost".into()).ok()?;
-    if !host.is_object() {
-        return None;
-    }
-    let udp = Reflect::get(&host, &"udp".into()).ok()?;
-    udp.is_object().then_some(udp)
+/// Returns `window.webviewSockets` if the host app injected it.
+fn host_api() -> Option<JsValue> {
+    let api = Reflect::get(&js_sys::global(), &"webviewSockets".into()).ok()?;
+    api.is_object().then_some(api)
 }
 
 fn get_string(obj: &JsValue, key: &str) -> Option<String> {
@@ -192,6 +189,7 @@ fn proto_error(code: proto::ErrorCode, msg: &str) -> (io::ErrorKind, String) {
         proto::ErrorCode::NotAllowed => io::ErrorKind::PermissionDenied,
         proto::ErrorCode::InvalidInput => io::ErrorKind::InvalidInput,
         proto::ErrorCode::AddrInUse => io::ErrorKind::AddrInUse,
+        proto::ErrorCode::NameNotResolved => io::ErrorKind::NotFound,
         proto::ErrorCode::Limit | proto::ErrorCode::Io => io::ErrorKind::Other,
     };
     (kind, format!("host error {}: {msg}", code.name()))
@@ -280,6 +278,8 @@ struct State {
     max_gso_segments: usize,
     gro_segments: usize,
     peer: Option<SocketAddr>,
+    /// Opened in connected mode: sends wait for BOUND, which sets `peer`.
+    connected_mode: bool,
     hello: Vec<u8>,
     recv: VecDeque<Datagram>,
     recv_bytes: usize,
@@ -444,6 +444,9 @@ impl Shared {
                 debug!(id = self.id, local = %bound.local, "udp socket bound");
                 state.phase = Phase::Bound;
                 state.local = Some(bound.local);
+                if let Some(remote) = bound.remote {
+                    state.peer = Some(remote);
+                }
                 state.interface_addrs = bound.interface_addrs;
                 state.max_gso_segments = bound.max_gso_segments.max(1) as usize;
                 state.gro_segments = bound.gro_segments.max(1) as usize;
@@ -641,23 +644,56 @@ fn would_block() -> io::Error {
 
 impl Socket {
     pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Self::open(addr, |token| proto::Hello::bind(token, addr))
+    }
+
+    pub(crate) fn connect_host(
+        host: &str,
+        port: u16,
+        dns: Option<crate::DnsQueryType>,
+    ) -> io::Result<Self> {
+        let dns_query_type = dns.map(|d| match d {
+            crate::DnsQueryType::Ipv4 => proto::DnsQueryType::Ipv4,
+            crate::DnsQueryType::Ipv6 => proto::DnsQueryType::Ipv6,
+        });
+        let any = match dns {
+            Some(crate::DnsQueryType::Ipv6) => SocketAddr::from(([0u16; 8], 0)),
+            _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+        };
+        let sock = Self::open(any, |token| proto::Hello {
+            token,
+            mode: proto::Mode::Connected {
+                remote_host: host,
+                remote_port: port,
+                dns_query_type,
+            },
+            send_buffer_size: 0,
+            receive_buffer_size: 0,
+        })?;
+        sock.lock().connected_mode = true;
+        Ok(sock)
+    }
+
+    /// Opens the WebSocket and queues the HELLO built by `hello`.
+    ///
+    /// `requested` is the local address reported until BOUND arrives.
+    fn open<'a>(
+        requested: SocketAddr,
+        hello: impl FnOnce([u8; proto::TOKEN_LEN]) -> proto::Hello<'a>,
+    ) -> io::Result<Self> {
+        let addr = requested;
         let session = SESSION.lock().expect("poisoned").clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "no UDP session, call wasm_native_udp::init() first",
+                "no UDP session, call webview_sockets::init() first",
             )
         })?;
         let ws = WebSocket::new(&session.url).map_err(js_error)?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        let mut hello = Vec::new();
-        proto::encode_hello(
-            &proto::Hello {
-                token: session.token,
-                bind_addr: addr,
-            },
-            &mut hello,
-        );
+        let mut hello_msg = Vec::new();
+        proto::encode_hello(&hello(session.token), &mut hello_msg);
+        let hello = hello_msg;
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             id,
@@ -669,6 +705,7 @@ impl Socket {
                 max_gso_segments: 1,
                 gro_segments: 1,
                 peer: None,
+                connected_mode: false,
                 hello,
                 recv: VecDeque::new(),
                 recv_bytes: 0,
@@ -717,7 +754,7 @@ impl Socket {
                 },
             )
         });
-        debug!(id, %addr, "udp socket binding");
+        debug!(id, %addr, "udp socket opening");
         Ok(Self { shared })
     }
 
@@ -777,13 +814,28 @@ impl Socket {
     }
 
     pub(crate) fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let peer = self.peer_addr()?;
+        let peer = {
+            let state = self.lock();
+            match state.peer {
+                Some(peer) => peer,
+                None if state.connected_mode => {
+                    return Err(state.failed().unwrap_or_else(would_block));
+                }
+                None => return Err(not_connected()),
+            }
+        };
         self.send_to(buf, peer)
     }
 
     pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.lock().peer.is_none() {
-            return Err(not_connected());
+        {
+            let state = self.lock();
+            if state.peer.is_none() {
+                return Err(match state.connected_mode {
+                    true => state.failed().unwrap_or_else(would_block),
+                    false => not_connected(),
+                });
+            }
         }
         self.recv_from(buf).map(|(n, _)| n)
     }
@@ -931,7 +983,8 @@ impl Socket {
             return Poll::Ready(Err(err));
         }
         self.shared.refresh_pressure(&mut state);
-        if !state.paused {
+        let waiting_for_peer = state.connected_mode && matches!(state.phase, Phase::Connecting);
+        if !state.paused && !waiting_for_peer {
             return Poll::Ready(Ok(()));
         }
         add_waker(&mut state.send_wakers, cx);

@@ -1,51 +1,81 @@
 //! Host, origin, bind and destination checks.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
-/// Returns whether `host` is `<label>.(blake3|pkarr).localhost:<port>`.
+/// Decides which page hosts may use sockets.
 ///
-/// `label` is `[a-z0-9]+`, `port` a decimal u16.
-pub(crate) fn is_gateway_host(host: &str) -> bool {
-    let Some((name, port)) = host.rsplit_once(':') else {
-        return false;
-    };
-    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) || port.parse::<u16>().is_err()
-    {
-        return false;
+/// The host app passes its own rule, e.g. "only my gateway origins". The
+/// checked value is the `Host` authority as sent by the browser, with the
+/// port if the URL has one (`app.localhost:8080`). Independent of the policy,
+/// `Origin` must equal `"http://" + Host` or `"https://" + Host`.
+#[derive(Clone)]
+pub enum HostPolicy {
+    /// Any host. Only for dev tools.
+    Any,
+    /// Hosts for which the function returns true.
+    Only(Arc<dyn Fn(&str) -> bool + Send + Sync>),
+}
+
+impl HostPolicy {
+    /// Returns a policy that allows hosts for which `f` returns true.
+    pub fn from_fn(f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self::Only(Arc::new(f))
     }
-    let Some(rest) = name
-        .strip_suffix(".blake3.localhost")
-        .or_else(|| name.strip_suffix(".pkarr.localhost"))
-    else {
-        return false;
-    };
-    !rest.is_empty()
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+
+    /// Returns a policy that allows exactly the given host authorities.
+    pub fn allowlist(hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let hosts: BTreeSet<String> = hosts.into_iter().map(Into::into).collect();
+        Self::from_fn(move |host| hosts.contains(host))
+    }
+
+    /// Returns whether `host` (an authority, `name[:port]`) is allowed.
+    pub fn allows(&self, host: &str) -> bool {
+        !host.is_empty()
+            && match self {
+                Self::Any => true,
+                Self::Only(f) => f(host),
+            }
+    }
+}
+
+impl fmt::Debug for HostPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Any => f.write_str("HostPolicy::Any"),
+            Self::Only(_) => f.write_str("HostPolicy::Only(..)"),
+        }
+    }
+}
+
+/// Splits an origin into its host authority, accepting `http` and `https`.
+fn origin_host(origin: &str) -> Option<&str> {
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
 }
 
 /// Returns whether a bridge-reported origin may get a ticket.
-pub(crate) fn origin_ok(origin: &str, check_host: bool) -> bool {
-    match origin.strip_prefix("http://") {
-        Some(host) if check_host => is_gateway_host(host),
-        Some(host) => !host.is_empty(),
-        None => false,
-    }
+pub(crate) fn origin_ok(origin: &str, policy: &HostPolicy) -> bool {
+    origin_host(origin).is_some_and(|host| policy.allows(host))
 }
 
 /// Checks the WebSocket upgrade headers. Returns the origin on success.
 pub(crate) fn check_upgrade<'a>(
     host: Option<&str>,
     origin: Option<&'a str>,
-    check_host: bool,
+    policy: &HostPolicy,
 ) -> Result<&'a str, &'static str> {
     let host = host.ok_or("missing Host")?;
     let origin = origin.ok_or("missing Origin")?;
-    if check_host && !is_gateway_host(host) {
-        return Err("Host is not a gateway host");
+    if !policy.allows(host) {
+        return Err("Host is not allowed");
     }
-    match origin.strip_prefix("http://") {
+    match origin_host(origin) {
         Some(o) if o == host => Ok(origin),
         _ => Err("Origin does not match Host"),
     }
@@ -90,33 +120,64 @@ fn is_broadcast(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    /// The pattern iroh-link uses: `<label>.(blake3|pkarr).localhost:<port>`.
+    fn gateway() -> HostPolicy {
+        HostPolicy::from_fn(|host| {
+            let Some((name, port)) = host.rsplit_once(':') else {
+                return false;
+            };
+            let label = name
+                .strip_suffix(".blake3.localhost")
+                .or_else(|| name.strip_suffix(".pkarr.localhost"));
+            port.parse::<u16>().is_ok()
+                && label.is_some_and(|l| {
+                    !l.is_empty()
+                        && l.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                })
+        })
+    }
+
     #[test]
-    fn gateway_host() {
-        assert!(is_gateway_host("abc123.pkarr.localhost:45475"));
-        assert!(is_gateway_host("x.blake3.localhost:1"));
-        assert!(!is_gateway_host("abc.pkarr.localhost"));
-        assert!(!is_gateway_host("abc.pkarr.localhost:"));
-        assert!(!is_gateway_host("abc.pkarr.localhost:99999"));
-        assert!(!is_gateway_host("abc.pkarr.localhost:+80"));
-        assert!(!is_gateway_host(".pkarr.localhost:80"));
-        assert!(!is_gateway_host("Abc.pkarr.localhost:80"));
-        assert!(!is_gateway_host("a.b.pkarr.localhost:80"));
-        assert!(!is_gateway_host("a-b.pkarr.localhost:80"));
-        assert!(!is_gateway_host("a.other.localhost:80"));
-        assert!(!is_gateway_host("a.pkarr.localhost.evil.com:80"));
-        assert!(!is_gateway_host("127.0.0.1:80"));
+    fn policies() {
+        assert!(HostPolicy::Any.allows("anything:1"));
+        assert!(!HostPolicy::Any.allows(""));
+        let list = HostPolicy::allowlist(["a.localhost:5", "b.localhost"]);
+        assert!(list.allows("a.localhost:5"));
+        assert!(list.allows("b.localhost"));
+        assert!(!list.allows("a.localhost:6"));
+        assert!(!list.allows("a.localhost"));
+        let g = gateway();
+        assert!(g.allows("abc123.pkarr.localhost:45475"));
+        assert!(!g.allows("abc.pkarr.localhost"));
+        assert!(!g.allows("Abc.pkarr.localhost:80"));
+    }
+
+    #[test]
+    fn origins() {
+        let g = gateway();
+        assert!(origin_ok("http://a.pkarr.localhost:5", &g));
+        assert!(origin_ok("https://a.pkarr.localhost:5", &g));
+        assert!(!origin_ok("ftp://a.pkarr.localhost:5", &g));
+        assert!(!origin_ok("http://example.com", &g));
+        assert!(!origin_ok("null", &HostPolicy::Any));
+        assert!(!origin_ok("http://", &HostPolicy::Any));
+        assert!(origin_ok("http://example.com", &HostPolicy::Any));
     }
 
     #[test]
     fn upgrade() {
+        let g = gateway();
         let h = Some("a.pkarr.localhost:5");
-        assert!(check_upgrade(h, Some("http://a.pkarr.localhost:5"), true).is_ok());
-        assert!(check_upgrade(h, Some("http://b.pkarr.localhost:5"), true).is_err());
-        assert!(check_upgrade(h, Some("https://a.pkarr.localhost:5"), true).is_err());
-        assert!(check_upgrade(h, None, true).is_err());
-        assert!(check_upgrade(None, Some("http://a.pkarr.localhost:5"), true).is_err());
-        assert!(check_upgrade(Some("127.0.0.1:5"), Some("http://127.0.0.1:5"), true).is_err());
-        assert!(check_upgrade(Some("127.0.0.1:5"), Some("http://127.0.0.1:5"), false).is_ok());
+        assert!(check_upgrade(h, Some("http://a.pkarr.localhost:5"), &g).is_ok());
+        assert!(check_upgrade(h, Some("https://a.pkarr.localhost:5"), &g).is_ok());
+        assert!(check_upgrade(h, Some("http://b.pkarr.localhost:5"), &g).is_err());
+        assert!(check_upgrade(h, Some("ws://a.pkarr.localhost:5"), &g).is_err());
+        assert!(check_upgrade(h, None, &g).is_err());
+        assert!(check_upgrade(None, Some("http://a.pkarr.localhost:5"), &g).is_err());
+        let ip = Some("127.0.0.1:5");
+        assert!(check_upgrade(ip, Some("http://127.0.0.1:5"), &g).is_err());
+        assert!(check_upgrade(ip, Some("http://127.0.0.1:5"), &HostPolicy::Any).is_ok());
     }
 
     #[test]

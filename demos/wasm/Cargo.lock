@@ -203,22 +203,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh-link-udp-demo-wasm"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "n0-future",
- "tokio",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-native-udp",
-]
-
-[[package]]
-name = "iroh-link-udp-proto"
-version = "0.1.6"
-
-[[package]]
 name = "js-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,18 +635,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-native-udp"
-version = "0.1.6"
-dependencies = [
- "iroh-link-udp-proto",
- "js-sys",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -681,6 +653,34 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "webview-sockets"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webview-sockets-proto",
+]
+
+[[package]]
+name = "webview-sockets-demo-wasm"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "n0-future",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "webview-sockets",
+]
+
+[[package]]
+name = "webview-sockets-proto"
+version = "0.1.0"
 
 [[package]]
 name = "windows-link"

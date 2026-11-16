@@ -6,12 +6,16 @@ fn v4(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }
 
-fn hello(bind_addr: SocketAddr) -> Hello {
+fn token() -> [u8; TOKEN_LEN] {
     let mut token = [0u8; TOKEN_LEN];
     for (i, b) in token.iter_mut().enumerate() {
         *b = i as u8;
     }
-    Hello { token, bind_addr }
+    token
+}
+
+fn hello(bind_addr: SocketAddr) -> Hello<'static> {
+    Hello::bind(token(), bind_addr)
 }
 
 fn encoded<F: FnOnce(&mut Vec<u8>)>(f: F) -> Vec<u8> {
@@ -33,16 +37,109 @@ fn hello_roundtrip_v4_v6() {
 
 #[test]
 fn hello_exact_bytes() {
-    let h = hello(v4("1.2.3.4:258"));
+    let mut h = hello(v4("1.2.3.4:258"));
+    h.send_buffer_size = 0x0102_0304;
+    h.mode = Mode::Bound {
+        local: v4("1.2.3.4:258"),
+        ipv6_only: Some(true),
+    };
     let buf = encoded(|o| encode_hello(&h, o));
-    assert_eq!(buf.len(), 2 + 32 + 7);
-    assert_eq!(&buf[34..], &[4, 1, 2, 3, 4, 1, 2]);
+    assert_eq!(buf.len(), 2 + 32 + 8 + 1 + 7 + 1);
+    assert_eq!(&buf[34..42], &[1, 2, 3, 4, 0, 0, 0, 0]);
+    assert_eq!(&buf[42..], &[0, 4, 1, 2, 3, 4, 1, 2, 2]);
+}
+
+#[test]
+fn hello_connected_roundtrip() {
+    for (host, dns) in [
+        ("example.com", None),
+        ("127.0.0.1", Some(DnsQueryType::Ipv4)),
+        ("[::1]", Some(DnsQueryType::Ipv6)),
+        ("", None),
+    ] {
+        let h = Hello {
+            token: token(),
+            mode: Mode::Connected {
+                remote_host: host,
+                remote_port: 443,
+                dns_query_type: dns,
+            },
+            send_buffer_size: 1,
+            receive_buffer_size: 65536,
+        };
+        let buf = encoded(|o| encode_hello(&h, o));
+        assert_eq!(decode_first(&buf).unwrap(), Frame::Hello(h));
+    }
+    // Long names are cut to MAX_HOST_LEN at a char boundary.
+    let long = "\u{e9}".repeat(200);
+    let h = Hello::connect(token(), &long, 1);
+    let buf = encoded(|o| encode_hello(&h, o));
+    let Frame::Hello(d) = decode_first(&buf).unwrap() else {
+        panic!("not hello");
+    };
+    let Mode::Connected { remote_host, .. } = d.mode else {
+        panic!("not connected");
+    };
+    assert_eq!(remote_host.len(), 254);
+}
+
+#[test]
+fn named_data_roundtrip() {
+    let named = NamedData {
+        ecn: 2,
+        host: "example.com",
+        port: 53,
+        dns_query_type: Some(DnsQueryType::Ipv6),
+        segment_size: 0,
+        payload: b"query",
+    };
+    let data = Data {
+        ecn: 0,
+        peer: v4("1.2.3.4:5"),
+        segment_size: 0,
+        payload: b"x",
+    };
+    let mut buf = Vec::new();
+    encode_named_data(&named, &mut buf);
+    encode_data(&data, &mut buf);
+    assert_eq!(buf.len(), named.encoded_len() + data.encoded_len());
+    let recs: Vec<_> = decode_records(&buf)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(recs, [Record::Named(named), Record::Data(data)]);
+    // The host-to-page decoder refuses named records.
+    let mut it = decode_data(&buf).unwrap();
+    assert_eq!(
+        it.next(),
+        Some(Err(DecodeError::UnexpectedKind(KIND_DATA_NAMED)))
+    );
+    assert_eq!(it.next(), None);
+    // Truncated prefixes and bad dns bytes.
+    let one = encoded(|o| encode_named_data(&named, o));
+    for n in 1..one.len() {
+        let mut it = decode_records(&one[..n]).unwrap();
+        assert_eq!(it.next(), Some(Err(DecodeError::Truncated)), "n={n}");
+    }
+    let mut bad_dns = one.clone();
+    bad_dns[2] = 5;
+    assert_eq!(
+        decode_records(&bad_dns).unwrap().next(),
+        Some(Err(DecodeError::BadDnsQueryType(5)))
+    );
+    let mut bad_utf8 = one.clone();
+    bad_utf8[4] = 0xff;
+    assert_eq!(
+        decode_records(&bad_utf8).unwrap().next(),
+        Some(Err(DecodeError::InvalidUtf8))
+    );
 }
 
 #[test]
 fn bound_roundtrip() {
     let b = Bound {
         local: v4("[::]:5000"),
+        remote: None,
         max_gso_segments: 64,
         gro_segments: 1,
         interface_addrs: vec![v4("10.0.0.2:5000"), v4("[2001:db8::2]:5000")],
@@ -50,8 +147,19 @@ fn bound_roundtrip() {
     let buf = encoded(|o| encode_bound(&b, o));
     assert_eq!(decode_first(&buf).unwrap(), Frame::Bound(b));
 
+    let connected = Bound {
+        local: v4("192.168.1.2:5000"),
+        remote: Some(v4("[2001:db8::1]:443")),
+        max_gso_segments: 1,
+        gro_segments: 1,
+        interface_addrs: vec![],
+    };
+    let buf = encoded(|o| encode_bound(&connected, o));
+    assert_eq!(decode_first(&buf).unwrap(), Frame::Bound(connected));
+
     let empty = Bound {
         local: v4("127.0.0.1:1"),
+        remote: None,
         max_gso_segments: 1,
         gro_segments: 1,
         interface_addrs: vec![],
@@ -64,6 +172,7 @@ fn bound_roundtrip() {
 fn bound_caps_interface_addrs() {
     let b = Bound {
         local: v4("127.0.0.1:1"),
+        remote: None,
         max_gso_segments: 1,
         gro_segments: 1,
         interface_addrs: vec![v4("127.0.0.1:1"); 300],
@@ -77,7 +186,7 @@ fn bound_caps_interface_addrs() {
 
 #[test]
 fn error_roundtrip_all_codes() {
-    for code in 1..=5u8 {
+    for code in 1..=6u8 {
         let code = ErrorCode::from_u8(code).unwrap();
         let e = ErrorFrame {
             code,
@@ -87,7 +196,7 @@ fn error_roundtrip_all_codes() {
         assert_eq!(decode_first(&buf).unwrap(), Frame::Error(e));
     }
     assert_eq!(ErrorCode::from_u8(0), None);
-    assert_eq!(ErrorCode::from_u8(6), None);
+    assert_eq!(ErrorCode::from_u8(7), None);
 }
 
 #[test]
@@ -200,14 +309,27 @@ fn malformed_first() {
     trailing.push(0);
     assert_eq!(decode_first(&trailing), Err(DecodeError::TrailingBytes));
     let mut bad_version = h.clone();
-    bad_version[1] = 2;
+    bad_version[1] = 1;
     assert_eq!(
         decode_first(&bad_version),
-        Err(DecodeError::UnsupportedVersion(2))
+        Err(DecodeError::UnsupportedVersion(1))
     );
+    let mut bad_mode = h.clone();
+    bad_mode[42] = 2;
+    assert_eq!(decode_first(&bad_mode), Err(DecodeError::UnknownMode(2)));
     let mut bad_family = h.clone();
-    bad_family[34] = 5;
+    bad_family[43] = 5;
     assert_eq!(decode_first(&bad_family), Err(DecodeError::BadFamily(5)));
+    let mut bad_v6only = h.clone();
+    *bad_v6only.last_mut().unwrap() = 3;
+    assert_eq!(decode_first(&bad_v6only), Err(DecodeError::BadFlag(3)));
+    let c = encoded(|o| encode_hello(&Hello::connect(token(), "a", 1), o));
+    let mut bad_dns = c.clone();
+    bad_dns[43] = 1;
+    assert_eq!(decode_first(&bad_dns), Err(DecodeError::BadDnsQueryType(1)));
+    let mut bad_host = c.clone();
+    bad_host[45] = 0xff;
+    assert_eq!(decode_first(&bad_host), Err(DecodeError::InvalidUtf8));
 
     assert_eq!(decode_first(&[]), Err(DecodeError::Empty));
     assert_eq!(decode_first(&[0x7f]), Err(DecodeError::UnknownKind(0x7f)));
@@ -311,5 +433,5 @@ fn js_codec_classic_strips_exports() {
     assert!(classic.len() < JS_CODEC.len());
     assert!(!classic.contains("export const"));
     assert!(!classic.contains(JS_CODEC_EXPORT_MARKER));
-    assert!(classic.contains("irohLinkUdpCodec"));
+    assert!(classic.contains("webviewSocketsCodec"));
 }

@@ -99,3 +99,32 @@ fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
         std::task::Poll::Pending => panic!("future not ready"),
     }
 }
+
+#[test]
+fn connect_host_by_name() {
+    let b = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    b.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let port = b.local_addr().expect("addr").port();
+    let a = UdpSocket::connect_host("localhost", port, Some(super::DnsQueryType::Ipv4))
+        .expect("connect");
+    assert_eq!(
+        a.peer_addr().expect("peer"),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    );
+    a.send(b"named").expect("send");
+    let mut buf = [0u8; 16];
+    let (n, from) = b.recv_from(&mut buf).expect("recv");
+    assert_eq!(&buf[..n], b"named");
+    assert_eq!(from, a.local_addr().expect("addr"));
+    let literal = UdpSocket::connect_host("[::1]", port, None);
+    if let Ok(s) = literal {
+        assert!(s.peer_addr().expect("peer").is_ipv6());
+    }
+    let err = UdpSocket::connect_host("localhost", port, Some(super::DnsQueryType::Ipv6))
+        .and_then(|s| s.peer_addr());
+    // localhost may or may not resolve to ::1.
+    if let Ok(peer) = err {
+        assert!(peer.is_ipv6());
+    }
+}

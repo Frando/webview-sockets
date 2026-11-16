@@ -3,14 +3,19 @@
 //! One WebSocket connection on [`WS_PATH`] carries one UDP socket. All frames
 //! are binary WebSocket messages, integers are big endian.
 //!
-//! - The page sends [`Hello`] as the first message.
+//! - The page sends [`Hello`] as the first message. It opens the socket in
+//!   one of the two modes of the Direct Sockets `UDPSocket`, see [`Mode`]:
+//!   bound to a local address, or connected to a remote host (a name or an
+//!   IP address, resolved by the host).
 //! - The host answers with [`Bound`] or [`ErrorFrame`] as the first message.
 //! - After [`Bound`], both directions send messages holding one or more
-//!   [`Data`] records back to back. The host may also send an [`ErrorFrame`]
-//!   message for a failed send; the socket stays open.
+//!   [`Data`] records back to back. In bound mode the page may also address
+//!   a datagram to a host name with a [`NamedData`] record. The host may also
+//!   send an [`ErrorFrame`] message for a failed send; the socket stays open.
 //!
 //! Use [`decode_first`] for messages starting with HELLO, BOUND or ERROR (see
-//! [`message_kind`]) and [`decode_data`] for DATA messages. Decoding borrows
+//! [`message_kind`]), [`decode_data`] for DATA messages from the host and
+//! [`decode_records`] for DATA messages from the page. Decoding borrows
 //! payloads and strings from the input, it does not copy.
 //!
 //! The same codec exists in JavaScript, see [`JS_CODEC`] and
@@ -24,10 +29,10 @@ use core::fmt;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// WebSocket path on the page's own origin.
-pub const WS_PATH: &str = "/.well-known/iroh-link/udp";
+pub const WS_PATH: &str = "/.well-known/webview-sockets/udp";
 
 /// Protocol version sent in [`Hello`].
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Maximum size of one WebSocket message in bytes (256 KiB).
 pub const MAX_MESSAGE_LEN: usize = 256 * 1024;
@@ -43,10 +48,19 @@ pub const KIND_BOUND: u8 = 0x02;
 pub const KIND_ERROR: u8 = 0x03;
 /// Record kind byte of a [`Data`] record.
 pub const KIND_DATA: u8 = 0x10;
+/// Record kind byte of a [`NamedData`] record.
+pub const KIND_DATA_NAMED: u8 = 0x11;
+
+/// Maximum length of a host name in [`Mode::Connected`] and [`NamedData`].
+pub const MAX_HOST_LEN: usize = 255;
 
 /// Header bytes of a DATA record besides the address: kind, ecn,
 /// segment_size, len.
 const DATA_FIXED_LEN: usize = 1 + 1 + 2 + 4;
+
+/// Header bytes of a DATA_NAMED record besides the host name: kind, ecn,
+/// dns_query_type, host length, port, segment_size, len.
+const NAMED_FIXED_LEN: usize = 1 + 1 + 1 + 1 + 2 + 2 + 4;
 
 /// WebSocket close codes the host uses.
 pub mod close_code {
@@ -70,11 +84,11 @@ pub mod close_code {
 pub const JS_CODEC: &str = include_str!("../js/codec.js");
 
 /// Marker line in [`JS_CODEC`] that starts the ES module export block.
-pub const JS_CODEC_EXPORT_MARKER: &str = "// @@iroh-link-udp-codec-module-exports@@";
+pub const JS_CODEC_EXPORT_MARKER: &str = "// @@webview-sockets-codec-module-exports@@";
 
 /// Returns the JavaScript codec without its ES module exports.
 ///
-/// The result declares a single lexical binding `irohLinkUdpCodec` holding
+/// The result declares a single lexical binding `webviewSocketsCodec` holding
 /// `{ encodeHello, decodeFirst, encodeData, decodeData, ... }`. Hosts that
 /// inject a classic script should paste it inside their own IIFE so that no
 /// name leaks into the page.
@@ -89,7 +103,8 @@ pub fn js_codec_classic() -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ErrorCode {
-    /// Bad or expired token, or the UDP setting is off.
+    /// Bad or expired token, the setting is off, or the destination is not
+    /// allowed.
     NotAllowed = 1,
     /// Invalid input, for example a forbidden destination address.
     InvalidInput = 2,
@@ -99,6 +114,8 @@ pub enum ErrorCode {
     Limit = 4,
     /// An IO error on the host.
     Io = 5,
+    /// A host name could not be resolved.
+    NameNotResolved = 6,
 }
 
 impl ErrorCode {
@@ -110,6 +127,7 @@ impl ErrorCode {
             3 => Self::AddrInUse,
             4 => Self::Limit,
             5 => Self::Io,
+            6 => Self::NameNotResolved,
             _ => return None,
         })
     }
@@ -122,24 +140,127 @@ impl ErrorCode {
             Self::AddrInUse => "AddrInUse",
             Self::Limit => "Limit",
             Self::Io => "Io",
+            Self::NameNotResolved => "NameNotResolved",
         }
     }
 }
 
-/// HELLO frame, page to host, first and only record of the first message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Hello {
-    /// Session token from `irohHost.udp.requestSession()`.
-    pub token: [u8; TOKEN_LEN],
-    /// Address to bind: `0.0.0.0:0`, `[::]:0` or a local address and port.
-    pub bind_addr: SocketAddr,
+/// Which address family a host name resolves to, like the Direct Sockets
+/// `SocketDnsQueryType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsQueryType {
+    /// Only IPv4 addresses (A records).
+    Ipv4,
+    /// Only IPv6 addresses (AAAA records).
+    Ipv6,
 }
 
-/// BOUND frame, host to page, reports the bound socket.
+impl DnsQueryType {
+    /// Returns the name used by Direct Sockets and the JavaScript codec.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+
+    /// Returns whether `ip` has the family this query type asks for.
+    pub fn matches(self, ip: &IpAddr) -> bool {
+        match self {
+            Self::Ipv4 => ip.is_ipv4(),
+            Self::Ipv6 => ip.is_ipv6(),
+        }
+    }
+}
+
+/// How the page wants the socket opened, the two modes of the Direct Sockets
+/// `UDPSocket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode<'a> {
+    /// Bound mode: bind to a local address and send to any destination.
+    ///
+    /// Direct Sockets options `localAddress`, `localPort` and `ipv6Only`.
+    Bound {
+        /// Address to bind: `0.0.0.0:0`, `[::]:0` or a local address and
+        /// port.
+        local: SocketAddr,
+        /// Sets `IPV6_V6ONLY` for a `[::]` bind; `None` keeps the host
+        /// default (dual stack where possible).
+        ipv6_only: Option<bool>,
+    },
+    /// Connected mode: the host resolves `remote_host`, binds an ephemeral
+    /// port and only exchanges datagrams with the resolved peer.
+    ///
+    /// Direct Sockets options `remoteAddress`, `remotePort` and
+    /// `dnsQueryType`.
+    Connected {
+        /// Host name or IP address literal (IPv6 with or without brackets).
+        ///
+        /// At most [`MAX_HOST_LEN`] bytes are encoded.
+        remote_host: &'a str,
+        /// Remote port.
+        remote_port: u16,
+        /// Address family to resolve `remote_host` to; `None` lets the host
+        /// choose.
+        dns_query_type: Option<DnsQueryType>,
+    },
+}
+
+/// HELLO frame, page to host, first and only record of the first message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hello<'a> {
+    /// Session token from `webviewSockets.requestSession()`.
+    pub token: [u8; TOKEN_LEN],
+    /// Bound or connected mode.
+    pub mode: Mode<'a>,
+    /// Requested kernel send buffer size in bytes, 0 for the host default.
+    ///
+    /// Direct Sockets option `sendBufferSize`. The host may cap it.
+    pub send_buffer_size: u32,
+    /// Requested kernel receive buffer size in bytes, 0 for the host default.
+    ///
+    /// Direct Sockets option `receiveBufferSize`. The host may cap it.
+    pub receive_buffer_size: u32,
+}
+
+impl<'a> Hello<'a> {
+    /// Returns a bound mode HELLO with default options.
+    pub fn bind(token: [u8; TOKEN_LEN], local: SocketAddr) -> Self {
+        Self {
+            token,
+            mode: Mode::Bound {
+                local,
+                ipv6_only: None,
+            },
+            send_buffer_size: 0,
+            receive_buffer_size: 0,
+        }
+    }
+
+    /// Returns a connected mode HELLO with default options.
+    pub fn connect(token: [u8; TOKEN_LEN], remote_host: &'a str, remote_port: u16) -> Self {
+        Self {
+            token,
+            mode: Mode::Connected {
+                remote_host,
+                remote_port,
+                dns_query_type: None,
+            },
+            send_buffer_size: 0,
+            receive_buffer_size: 0,
+        }
+    }
+}
+
+/// BOUND frame, host to page, reports the opened socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bound {
-    /// Local address of the bound socket.
+    /// Local address of the socket.
+    ///
+    /// In connected mode the IP is the one the host uses to reach the peer.
     pub local: SocketAddr,
+    /// The resolved peer in connected mode, `None` in bound mode.
+    pub remote: Option<SocketAddr>,
     /// Maximum number of GSO segments per send, 1 if GSO is not supported.
     pub max_gso_segments: u16,
     /// Maximum number of GRO segments per receive, 1 if GRO is not supported.
@@ -169,7 +290,7 @@ pub struct ErrorFrame<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame<'a> {
     /// See [`Hello`].
-    Hello(Hello),
+    Hello(Hello<'a>),
     /// See [`Bound`].
     Bound(Bound),
     /// See [`ErrorFrame`].
@@ -211,6 +332,46 @@ impl<'a> Data<'a> {
     }
 }
 
+/// DATA_NAMED record, page to host in bound mode: datagrams to a host name.
+///
+/// The host resolves `host` like for [`Mode::Connected`], then handles the
+/// record like a [`Data`] record to the resolved address. Not allowed in
+/// connected mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamedData<'a> {
+    /// ECN bits, 0 to 3. Encoding masks the value to 2 bits.
+    pub ecn: u8,
+    /// Host name or IP address literal.
+    ///
+    /// At most [`MAX_HOST_LEN`] bytes are encoded.
+    pub host: &'a str,
+    /// Destination port.
+    pub port: u16,
+    /// Address family to resolve `host` to; `None` lets the host choose.
+    pub dns_query_type: Option<DnsQueryType>,
+    /// 0 for a single datagram, else the size of each segment in `payload`.
+    pub segment_size: u16,
+    /// The datagram bytes.
+    pub payload: &'a [u8],
+}
+
+impl NamedData<'_> {
+    /// Returns the number of bytes [`encode_named_data`] appends for this
+    /// record.
+    pub fn encoded_len(&self) -> usize {
+        NAMED_FIXED_LEN + truncate_str(self.host, MAX_HOST_LEN).len() + self.payload.len()
+    }
+}
+
+/// A record in a DATA message from the page, see [`decode_records`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Record<'a> {
+    /// See [`Data`].
+    Data(Data<'a>),
+    /// See [`NamedData`].
+    Named(NamedData<'a>),
+}
+
 /// Error when decoding a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
@@ -230,9 +391,15 @@ pub enum DecodeError {
     UnsupportedVersion(u8),
     /// ERROR carries an unknown error code.
     UnknownErrorCode(u8),
+    /// HELLO carries an unknown mode byte.
+    UnknownMode(u8),
+    /// A dns_query_type byte is not 0, 4 or 6.
+    BadDnsQueryType(u8),
+    /// A boolean or option flag byte has an invalid value.
+    BadFlag(u8),
     /// ECN value larger than 3.
     BadEcn(u8),
-    /// ERROR message is not valid UTF-8.
+    /// An ERROR message or a host name is not valid UTF-8.
     InvalidUtf8,
     /// Bytes left after a HELLO, BOUND or ERROR frame.
     TrailingBytes,
@@ -250,6 +417,9 @@ impl DecodeError {
             Self::BadFamily(_) => "BadFamily",
             Self::UnsupportedVersion(_) => "UnsupportedVersion",
             Self::UnknownErrorCode(_) => "UnknownErrorCode",
+            Self::UnknownMode(_) => "UnknownMode",
+            Self::BadDnsQueryType(_) => "BadDnsQueryType",
+            Self::BadFlag(_) => "BadFlag",
             Self::BadEcn(_) => "BadEcn",
             Self::InvalidUtf8 => "InvalidUtf8",
             Self::TrailingBytes => "TrailingBytes",
@@ -270,8 +440,11 @@ impl fmt::Display for DecodeError {
             Self::BadFamily(v) => write!(f, "bad address family {v}"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported protocol version {v}"),
             Self::UnknownErrorCode(c) => write!(f, "unknown error code {c}"),
+            Self::UnknownMode(m) => write!(f, "unknown mode {m}"),
+            Self::BadDnsQueryType(v) => write!(f, "bad dns query type {v}"),
+            Self::BadFlag(v) => write!(f, "bad flag value {v}"),
             Self::BadEcn(v) => write!(f, "bad ecn value {v}"),
-            Self::InvalidUtf8 => write!(f, "error message is not valid utf-8"),
+            Self::InvalidUtf8 => write!(f, "string is not valid utf-8"),
             Self::TrailingBytes => write!(f, "trailing bytes after frame"),
         }
     }
@@ -287,18 +460,52 @@ pub fn message_kind(msg: &[u8]) -> Option<u8> {
     msg.first().copied()
 }
 
+/// Mode byte of [`Mode::Bound`].
+const MODE_BOUND: u8 = 0;
+/// Mode byte of [`Mode::Connected`].
+const MODE_CONNECTED: u8 = 1;
+
 /// Appends a HELLO frame to `out`.
-pub fn encode_hello(hello: &Hello, out: &mut Vec<u8>) {
+pub fn encode_hello(hello: &Hello<'_>, out: &mut Vec<u8>) {
     out.push(KIND_HELLO);
     out.push(VERSION);
     out.extend_from_slice(&hello.token);
-    put_addr(out, &hello.bind_addr);
+    out.extend_from_slice(&hello.send_buffer_size.to_be_bytes());
+    out.extend_from_slice(&hello.receive_buffer_size.to_be_bytes());
+    match hello.mode {
+        Mode::Bound { local, ipv6_only } => {
+            out.push(MODE_BOUND);
+            put_addr(out, &local);
+            out.push(match ipv6_only {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            });
+        }
+        Mode::Connected {
+            remote_host,
+            remote_port,
+            dns_query_type,
+        } => {
+            out.push(MODE_CONNECTED);
+            out.push(dns_byte(dns_query_type));
+            put_host(out, remote_host);
+            out.extend_from_slice(&remote_port.to_be_bytes());
+        }
+    }
 }
 
 /// Appends a BOUND frame to `out`.
 pub fn encode_bound(bound: &Bound, out: &mut Vec<u8>) {
     out.push(KIND_BOUND);
     put_addr(out, &bound.local);
+    match &bound.remote {
+        None => out.push(0),
+        Some(remote) => {
+            out.push(1);
+            put_addr(out, remote);
+        }
+    }
     out.extend_from_slice(&bound.max_gso_segments.to_be_bytes());
     out.extend_from_slice(&bound.gro_segments.to_be_bytes());
     let n = bound.interface_addrs.len().min(u8::MAX as usize);
@@ -331,6 +538,23 @@ pub fn encode_data(data: &Data<'_>, out: &mut Vec<u8>) {
     out.extend_from_slice(data.payload);
 }
 
+/// Appends a DATA_NAMED record to `out`.
+///
+/// Several records may be appended to one message, mixed with DATA records.
+/// The caller keeps the message within [`MAX_MESSAGE_LEN`], see
+/// [`NamedData::encoded_len`].
+pub fn encode_named_data(data: &NamedData<'_>, out: &mut Vec<u8>) {
+    out.reserve(data.encoded_len());
+    out.push(KIND_DATA_NAMED);
+    out.push(data.ecn & 0b11);
+    out.push(dns_byte(data.dns_query_type));
+    put_host(out, data.host);
+    out.extend_from_slice(&data.port.to_be_bytes());
+    out.extend_from_slice(&data.segment_size.to_be_bytes());
+    out.extend_from_slice(&(data.payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(data.payload);
+}
+
 /// Decodes a message holding a single HELLO, BOUND or ERROR frame.
 pub fn decode_first(msg: &[u8]) -> Result<Frame<'_>, DecodeError> {
     check_len(msg)?;
@@ -342,12 +566,46 @@ pub fn decode_first(msg: &[u8]) -> Result<Frame<'_>, DecodeError> {
             if version != VERSION {
                 return Err(DecodeError::UnsupportedVersion(version));
             }
-            let token = r.take(TOKEN_LEN)?.try_into().expect("length checked");
-            let bind_addr = r.addr()?;
-            Frame::Hello(Hello { token, bind_addr })
+            let token = r.array()?;
+            let send_buffer_size = r.u32()?;
+            let receive_buffer_size = r.u32()?;
+            let mode = match r.u8()? {
+                MODE_BOUND => {
+                    let local = r.addr()?;
+                    let ipv6_only = match r.u8()? {
+                        0 => None,
+                        1 => Some(false),
+                        2 => Some(true),
+                        other => return Err(DecodeError::BadFlag(other)),
+                    };
+                    Mode::Bound { local, ipv6_only }
+                }
+                MODE_CONNECTED => {
+                    let dns_query_type = r.dns()?;
+                    let remote_host = r.host()?;
+                    let remote_port = r.u16()?;
+                    Mode::Connected {
+                        remote_host,
+                        remote_port,
+                        dns_query_type,
+                    }
+                }
+                other => return Err(DecodeError::UnknownMode(other)),
+            };
+            Frame::Hello(Hello {
+                token,
+                mode,
+                send_buffer_size,
+                receive_buffer_size,
+            })
         }
         KIND_BOUND => {
             let local = r.addr()?;
+            let remote = match r.u8()? {
+                0 => None,
+                1 => Some(r.addr()?),
+                other => return Err(DecodeError::BadFlag(other)),
+            };
             let max_gso_segments = r.u16()?;
             let gro_segments = r.u16()?;
             let n = r.u8()? as usize;
@@ -357,6 +615,7 @@ pub fn decode_first(msg: &[u8]) -> Result<Frame<'_>, DecodeError> {
             }
             Frame::Bound(Bound {
                 local,
+                remote,
                 max_gso_segments,
                 gro_segments,
                 interface_addrs,
@@ -370,7 +629,7 @@ pub fn decode_first(msg: &[u8]) -> Result<Frame<'_>, DecodeError> {
                 core::str::from_utf8(r.take(len)?).map_err(|_| DecodeError::InvalidUtf8)?;
             Frame::Error(ErrorFrame { code, message })
         }
-        KIND_DATA => return Err(DecodeError::UnexpectedKind(kind)),
+        KIND_DATA | KIND_DATA_NAMED => return Err(DecodeError::UnexpectedKind(kind)),
         _ => return Err(DecodeError::UnknownKind(kind)),
     };
     if !r.0.is_empty() {
@@ -379,27 +638,56 @@ pub fn decode_first(msg: &[u8]) -> Result<Frame<'_>, DecodeError> {
     Ok(frame)
 }
 
-/// Decodes a message of DATA records.
+/// Decodes a message of DATA records, as sent by the host.
+///
+/// Fails early if the message is empty or too large; per-record errors are
+/// yielded by the iterator, which stops after the first error. A DATA_NAMED
+/// record is an error ([`DecodeError::UnexpectedKind`]), use
+/// [`decode_records`] for messages from the page.
+pub fn decode_data(msg: &[u8]) -> Result<DataIter<'_>, DecodeError> {
+    Ok(DataIter(decode_records(msg)?))
+}
+
+/// Decodes a message of DATA and DATA_NAMED records, as sent by the page.
 ///
 /// Fails early if the message is empty or too large; per-record errors are
 /// yielded by the iterator, which stops after the first error.
-pub fn decode_data(msg: &[u8]) -> Result<DataIter<'_>, DecodeError> {
+pub fn decode_records(msg: &[u8]) -> Result<RecordIter<'_>, DecodeError> {
     check_len(msg)?;
-    Ok(DataIter { rest: msg })
+    Ok(RecordIter { rest: msg })
 }
 
 /// Iterator over the DATA records of a message, see [`decode_data`].
 #[derive(Debug, Clone)]
-pub struct DataIter<'a> {
+pub struct DataIter<'a>(RecordIter<'a>);
+
+impl<'a> Iterator for DataIter<'a> {
+    type Item = Result<Data<'a>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(match self.0.next()? {
+            Ok(Record::Data(data)) => Ok(data),
+            Ok(Record::Named(_)) => {
+                self.0.rest = &[];
+                Err(DecodeError::UnexpectedKind(KIND_DATA_NAMED))
+            }
+            Err(err) => Err(err),
+        })
+    }
+}
+
+/// Iterator over the records of a message, see [`decode_records`].
+#[derive(Debug, Clone)]
+pub struct RecordIter<'a> {
     rest: &'a [u8],
 }
 
-impl<'a> DataIter<'a> {
-    fn next_record(&mut self) -> Result<Data<'a>, DecodeError> {
+impl<'a> RecordIter<'a> {
+    fn next_record(&mut self) -> Result<Record<'a>, DecodeError> {
         let mut r = Reader(self.rest);
         let kind = r.u8()?;
         match kind {
-            KIND_DATA => {}
+            KIND_DATA | KIND_DATA_NAMED => {}
             KIND_HELLO | KIND_BOUND | KIND_ERROR => {
                 return Err(DecodeError::UnexpectedKind(kind));
             }
@@ -409,22 +697,38 @@ impl<'a> DataIter<'a> {
         if ecn > 3 {
             return Err(DecodeError::BadEcn(ecn));
         }
-        let peer = r.addr()?;
-        let segment_size = r.u16()?;
-        let len = r.u32()? as usize;
-        let payload = r.take(len)?;
+        let record = if kind == KIND_DATA {
+            let peer = r.addr()?;
+            let segment_size = r.u16()?;
+            let len = r.u32()? as usize;
+            Record::Data(Data {
+                ecn,
+                peer,
+                segment_size,
+                payload: r.take(len)?,
+            })
+        } else {
+            let dns_query_type = r.dns()?;
+            let host = r.host()?;
+            let port = r.u16()?;
+            let segment_size = r.u16()?;
+            let len = r.u32()? as usize;
+            Record::Named(NamedData {
+                ecn,
+                host,
+                port,
+                dns_query_type,
+                segment_size,
+                payload: r.take(len)?,
+            })
+        };
         self.rest = r.0;
-        Ok(Data {
-            ecn,
-            peer,
-            segment_size,
-            payload,
-        })
+        Ok(record)
     }
 }
 
-impl<'a> Iterator for DataIter<'a> {
-    type Item = Result<Data<'a>, DecodeError>;
+impl<'a> Iterator for RecordIter<'a> {
+    type Item = Result<Record<'a>, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.rest.is_empty() {
@@ -469,6 +773,21 @@ fn put_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
+fn dns_byte(dns: Option<DnsQueryType>) -> u8 {
+    match dns {
+        None => 0,
+        Some(DnsQueryType::Ipv4) => 4,
+        Some(DnsQueryType::Ipv6) => 6,
+    }
+}
+
+/// Appends a host name with a u8 length prefix, cut to [`MAX_HOST_LEN`].
+fn put_host(out: &mut Vec<u8>, host: &str) {
+    let host = truncate_str(host, MAX_HOST_LEN);
+    out.push(host.len() as u8);
+    out.extend_from_slice(host.as_bytes());
+}
+
 fn truncate_str(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -506,6 +825,20 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    fn dns(&mut self) -> Result<Option<DnsQueryType>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            4 => Ok(Some(DnsQueryType::Ipv4)),
+            6 => Ok(Some(DnsQueryType::Ipv6)),
+            other => Err(DecodeError::BadDnsQueryType(other)),
+        }
+    }
+
+    fn host(&mut self) -> Result<&'a str, DecodeError> {
+        let len = self.u8()? as usize;
+        core::str::from_utf8(self.take(len)?).map_err(|_| DecodeError::InvalidUtf8)
     }
 
     fn addr(&mut self) -> Result<SocketAddr, DecodeError> {

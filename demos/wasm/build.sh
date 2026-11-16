@@ -5,7 +5,7 @@
 #
 # Needs the wasm32-unknown-unknown target and the wasm-bindgen CLI of the
 # version pinned in Cargo.toml (set WASM_BINDGEN to its path if the one on
-# PATH differs). The cfg wasm_native_udp comes from .cargo/config.toml.
+# PATH differs). The cfg webview_sockets comes from .cargo/config.toml.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
@@ -27,5 +27,5 @@ cargo build $flag --target wasm32-unknown-unknown
 target_dir="$(cargo metadata --format-version 1 --no-deps | node -e \
   'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).target_directory))')"
 "$wasm_bindgen" --target web --no-typescript --out-dir public/wasm \
-  "$target_dir/wasm32-unknown-unknown/$profile/iroh_link_udp_demo_wasm.wasm"
+  "$target_dir/wasm32-unknown-unknown/$profile/webview_sockets_demo_wasm.wasm"
 ls -l public/wasm

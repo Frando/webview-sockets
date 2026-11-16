@@ -2,4 +2,4 @@
 target = "wasm32-unknown-unknown"
 
 [target.wasm32-unknown-unknown]
-rustflags = ["--cfg", "wasm_native_udp"]
+rustflags = ["--cfg", "webview_sockets"]

@@ -1,6 +1,6 @@
 [package]
-name = "iroh-link-udp-host"
-description = "Host side of native UDP sockets for iroh-link web pages"
+name = "webview-sockets-host"
+description = "Host side of native UDP sockets for webview pages"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 data-encoding.workspace = true
-iroh-link-udp-proto = { path = "../udp-proto" }
+webview-sockets-proto = { path = "../proto" }
 n0-error.workspace = true
 netdev = "0.46"
 noq-udp = "1.3"

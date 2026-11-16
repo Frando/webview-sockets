@@ -1,7 +1,7 @@
-// Plain-JS native UDP demo for iroh-link pages.
+// Plain-JS native UDP demo for webview pages.
 //
-// Uses window.irohHost.udp.bind(). Outside the iroh-link apps, it loads the
-// test-host dev script from /.well-known/iroh-link/host.js.
+// Uses window.webviewSockets.udp.bind(). Outside a webview-sockets host app, it loads the
+// test-host dev script from /.well-known/webview-sockets/polyfill.js.
 //
 // Query params:
 //   ?peer=ip:port&send=text&expect=text  send, wait for the reply, report
@@ -11,7 +11,7 @@
 "use strict";
 
 (() => {
-  const HOST_JS = "/.well-known/iroh-link/host.js";
+  const HOST_JS = "/.well-known/webview-sockets/polyfill.js";
   const BENCH_SIZE = 1200;
   const MAX_LOG_LINES = 500;
 
@@ -98,22 +98,22 @@
     });
   }
 
-  // Returns window.irohHost or throws with the reason it is unavailable.
+  // Returns window.webviewSockets or throws with the reason it is unavailable.
   async function getHost() {
-    if (!window.irohHost) {
+    if (!window.webviewSockets) {
       try {
         await loadScript(HOST_JS);
       } catch {
         // Not served by the test host either; reported below.
       }
     }
-    if (!window.irohHost) {
-      throw new Error("not running in the iroh-link browser (window.irohHost is missing)");
+    if (!window.webviewSockets) {
+      throw new Error("not running in a webview-sockets host app (window.webviewSockets is missing)");
     }
-    if (!window.irohHost.udp || typeof window.irohHost.udp.bind !== "function") {
-      throw new Error(`host API version ${window.irohHost.version} has no udp.bind()`);
+    if (!window.webviewSockets.udp || typeof window.webviewSockets.udp.bind !== "function") {
+      throw new Error(`host API version ${window.webviewSockets.version} has no udp.bind()`);
     }
-    return window.irohHost;
+    return window.webviewSockets;
   }
 
   // Binds dual-stack [::]:0, falling back to 0.0.0.0:0.

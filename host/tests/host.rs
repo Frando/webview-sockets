@@ -3,20 +3,44 @@
 use std::{net::SocketAddr, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use iroh_link_udp_host::{Choice, Decision, Grant, Limits, TabId, UdpHost, UdpHostConfig, WS_PATH};
-use iroh_link_udp_proto::{
-    Bound, Data, ErrorCode, Frame, Hello, close_code, decode_data, decode_first, encode_data,
-    encode_hello,
-};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
+use webview_sockets_host::{
+    Choice, Decision, Grant, HostPolicy, Limits, TabId, UdpHost, UdpHostConfig, WS_PATH,
+};
+use webview_sockets_proto::{
+    Bound, Data, DnsQueryType, ErrorCode, Frame, Hello, Mode, NamedData, close_code, decode_data,
+    decode_first, encode_data, encode_hello, encode_named_data,
+};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The host pattern of iroh-link: `<label>.(blake3|pkarr).localhost:<port>`.
+fn gateway_policy() -> HostPolicy {
+    HostPolicy::from_fn(|host| {
+        let Some((name, port)) = host.rsplit_once(':') else {
+            return false;
+        };
+        let label = name
+            .strip_suffix(".blake3.localhost")
+            .or_else(|| name.strip_suffix(".pkarr.localhost"));
+        port.parse::<u16>().is_ok()
+            && label.is_some_and(|l| {
+                !l.is_empty()
+                    && l.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            })
+    })
+}
+
+fn config(path: impl Into<std::path::PathBuf>) -> UdpHostConfig {
+    UdpHostConfig::new(path, gateway_policy())
+}
 
 struct Env {
     host: UdpHost,
@@ -31,7 +55,7 @@ impl Env {
 
     async fn with_limits(limits: Limits) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = UdpHostConfig::new(dir.path().join("udp-grants.json"));
+        let mut config = config(dir.path().join("udp-grants.json"));
         config.limits = limits;
         let host = UdpHost::new(config).unwrap();
         host.set_enabled(true);
@@ -92,18 +116,18 @@ impl Env {
             .unwrap()
     }
 
-    /// Connects, sends HELLO and returns the first frame.
+    /// Connects, sends a bound mode HELLO and returns the first frame.
     async fn open(&self, label: &str, token: [u8; 32], bind: &str) -> (Ws, Reply) {
+        self.open_with(label, Hello::bind(token, bind.parse().unwrap()))
+            .await
+    }
+
+    /// Connects, sends `hello` and returns the first frame.
+    async fn open_with(&self, label: &str, hello: Hello<'_>) -> (Ws, Reply) {
         let mut ws = self.connect(label).await;
-        let mut hello = Vec::new();
-        encode_hello(
-            &Hello {
-                token,
-                bind_addr: bind.parse().unwrap(),
-            },
-            &mut hello,
-        );
-        ws.send(Message::Binary(hello.into())).await.unwrap();
+        let mut msg = Vec::new();
+        encode_hello(&hello, &mut msg);
+        ws.send(Message::Binary(msg.into())).await.unwrap();
         let reply = first_reply(&mut ws).await;
         (ws, reply)
     }
@@ -527,7 +551,7 @@ async fn decisions_and_persistence() {
     };
     assert_ne!(t1.token, t3.token);
 
-    let host2 = UdpHost::new(UdpHostConfig::new(&path)).unwrap();
+    let host2 = UdpHost::new(config(&path)).unwrap();
     assert!(host2.enabled());
     assert!(matches!(host2.request(&a, TabId(9)), Decision::Granted(_)));
     assert_eq!(host2.request(&b, TabId(9)), Decision::Denied);
@@ -543,11 +567,11 @@ async fn decisions_and_persistence() {
 
     host2.set_enabled(false);
     assert_eq!(host2.request(&a, TabId(1)), Decision::Disabled);
-    let host3 = UdpHost::new(UdpHostConfig::new(&path)).unwrap();
+    let host3 = UdpHost::new(config(&path)).unwrap();
     assert!(!host3.enabled());
 
     // Off by default.
-    let fresh = UdpHost::new(UdpHostConfig::new(env.dir.path().join("none.json"))).unwrap();
+    let fresh = UdpHost::new(config(env.dir.path().join("none.json"))).unwrap();
     assert!(!fresh.enabled());
     assert_eq!(fresh.request(&a, TabId(1)), Decision::Disabled);
     assert!(fresh.answer(&a, TabId(1), Choice::AllowAlways).is_none());
@@ -599,4 +623,190 @@ async fn ninth_socket_rejected() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let (_, reply) = env.open("app", token, "0.0.0.0:0").await;
     assert!(matches!(reply, Reply::Bound(_)));
+}
+
+#[tokio::test]
+async fn https_origin_accepted() {
+    let env = Env::new().await;
+    let host = env.authority("app");
+    let origin = format!("https://{host}");
+    assert!(env.connect_raw(Some(&host), Some(&origin)).await.is_ok());
+    let ticket = env
+        .host
+        .answer(&origin, TabId(1), Choice::AllowOnce)
+        .unwrap();
+    assert!(ticket.url.starts_with("wss://"));
+}
+
+#[tokio::test]
+async fn connected_mode_ip_literal() {
+    let env = Env::new().await;
+    let (echo, _task) = spawn_echo();
+    let token = env.token("app", 1);
+    let echo_host = echo.ip().to_string();
+    let (mut ws, reply) = env
+        .open_with("app", Hello::connect(token, &echo_host, echo.port()))
+        .await;
+    let Reply::Bound(bound) = reply else {
+        panic!("expected BOUND, got {reply:?}");
+    };
+    assert_eq!(bound.remote, Some(echo));
+    assert_eq!(bound.local.ip(), echo.ip());
+    assert_ne!(bound.local.port(), 0);
+
+    // A stranger's datagram is dropped, the peer's arrives.
+    let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    stranger.send_to(b"not for you", bound.local).await.unwrap();
+    send_data(&mut ws, echo, 0, b"hi").await;
+    assert_eq!(recv_data(&mut ws).await, vec![(echo, b"hi".to_vec())]);
+
+    // Sends to another address are refused, the socket stays open.
+    let other = stranger.local_addr().unwrap();
+    send_data(&mut ws, other, 0, b"x").await;
+    assert!(matches!(
+        first_reply(&mut ws).await,
+        Reply::Error(ErrorCode::InvalidInput, _)
+    ));
+    // So are named records.
+    let mut msg = Vec::new();
+    encode_named_data(
+        &NamedData {
+            ecn: 0,
+            host: "localhost",
+            port: echo.port(),
+            dns_query_type: None,
+            segment_size: 0,
+            payload: b"x",
+        },
+        &mut msg,
+    );
+    ws.send(Message::Binary(msg.into())).await.unwrap();
+    assert!(matches!(
+        first_reply(&mut ws).await,
+        Reply::Error(ErrorCode::InvalidInput, _)
+    ));
+    send_data(&mut ws, echo, 0, b"again").await;
+    assert_eq!(recv_data(&mut ws).await, vec![(echo, b"again".to_vec())]);
+}
+
+#[tokio::test]
+async fn connected_mode_host_name() {
+    let env = Env::new().await;
+    let (echo, _task) = spawn_echo();
+    let token = env.token("app", 1);
+    let hello = Hello {
+        token,
+        mode: Mode::Connected {
+            remote_host: "localhost",
+            remote_port: echo.port(),
+            dns_query_type: Some(DnsQueryType::Ipv4),
+        },
+        send_buffer_size: 64 * 1024,
+        receive_buffer_size: 64 * 1024,
+    };
+    let (mut ws, reply) = env.open_with("app", hello).await;
+    let Reply::Bound(bound) = reply else {
+        panic!("expected BOUND, got {reply:?}");
+    };
+    assert_eq!(bound.remote, Some(echo));
+    send_data(&mut ws, echo, 0, b"by name").await;
+    assert_eq!(recv_data(&mut ws).await, vec![(echo, b"by name".to_vec())]);
+
+    // Errors: unknown name, bad name, port 0, forbidden address.
+    for (name, port, code) in [
+        ("nx.invalid", 9, ErrorCode::NameNotResolved),
+        ("bad name!", 9, ErrorCode::InvalidInput),
+        ("127.0.0.1", 0, ErrorCode::InvalidInput),
+        ("[ff02::1]", 9, ErrorCode::InvalidInput),
+        ("255.255.255.255", 9, ErrorCode::InvalidInput),
+    ] {
+        let (mut ws, reply) = env
+            .open_with("app", Hello::connect(token, name, port))
+            .await;
+        match reply {
+            Reply::Error(c, _) => assert_eq!(c, code, "{name}"),
+            other => panic!("{name}: expected {code:?}, got {other:?}"),
+        }
+        close_code_of(&mut ws).await;
+    }
+}
+
+#[tokio::test]
+async fn named_data_in_bound_mode() {
+    let env = Env::new().await;
+    let (echo, _task) = spawn_echo();
+    let token = env.token("app", 1);
+    let (mut ws, _) = env.bound("app", token).await;
+    let mut msg = Vec::new();
+    for payload in [&b"one"[..], b"two"] {
+        encode_named_data(
+            &NamedData {
+                ecn: 0,
+                host: "localhost",
+                port: echo.port(),
+                dns_query_type: None,
+                segment_size: 0,
+                payload,
+            },
+            &mut msg,
+        );
+    }
+    ws.send(Message::Binary(msg.into())).await.unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        got.extend(recv_data(&mut ws).await);
+    }
+    assert_eq!(got, vec![(echo, b"one".to_vec()), (echo, b"two".to_vec())]);
+
+    let mut msg = Vec::new();
+    encode_named_data(
+        &NamedData {
+            ecn: 0,
+            host: "nx.invalid",
+            port: 9,
+            dns_query_type: None,
+            segment_size: 0,
+            payload: b"x",
+        },
+        &mut msg,
+    );
+    ws.send(Message::Binary(msg.into())).await.unwrap();
+    assert!(matches!(
+        first_reply(&mut ws).await,
+        Reply::Error(ErrorCode::NameNotResolved, _)
+    ));
+}
+
+#[tokio::test]
+async fn bind_options() {
+    let env = Env::new().await;
+    let token = env.token("app", 1);
+    // ipv6Only only goes with [::].
+    let hello = Hello {
+        token,
+        mode: Mode::Bound {
+            local: "0.0.0.0:0".parse().unwrap(),
+            ipv6_only: Some(true),
+        },
+        send_buffer_size: 0,
+        receive_buffer_size: 0,
+    };
+    let (mut ws, reply) = env.open_with("app", hello).await;
+    assert!(matches!(reply, Reply::Error(ErrorCode::InvalidInput, _)));
+    close_code_of(&mut ws).await;
+
+    let hello = Hello {
+        token,
+        mode: Mode::Bound {
+            local: "[::]:0".parse().unwrap(),
+            ipv6_only: Some(true),
+        },
+        send_buffer_size: 1 << 30,
+        receive_buffer_size: 1,
+    };
+    match env.open_with("app", hello).await.1 {
+        Reply::Bound(b) => assert!(b.local.is_ipv6()),
+        // No IPv6 on this machine.
+        Reply::Error(code, msg) => assert_ne!(code, ErrorCode::InvalidInput, "{msg}"),
+    }
 }
