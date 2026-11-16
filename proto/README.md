@@ -12,10 +12,10 @@ implementations are checked against the shared test vectors in
 
 ```sh
 cargo test -p iroh-link-udp-proto
-node iroh-link-udp-proto/js/codec.test.mjs
+node udp-proto/js/codec.test.mjs
 ```
 
-The host side is [`iroh-link-udp-host`](../iroh-link-udp-host/README.md), the
+The host side is [`iroh-link-udp-host`](../udp-host/README.md), the
 Rust page side is [`wasm-native-udp`](../wasm-native-udp/README.md).
 
 ## License

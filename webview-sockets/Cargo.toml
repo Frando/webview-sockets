@@ -5,14 +5,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
-repository.workspace = true
 publish = false
 
 [dependencies]
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-iroh-link-udp-proto = { path = "../iroh-link-udp-proto" }
+iroh-link-udp-proto = { path = "../udp-proto" }
 js-sys = "0.3.105"
 tracing = { workspace = true }
 wasm-bindgen = "0.2.128"

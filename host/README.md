@@ -1,11 +1,11 @@
 # iroh-link-udp-host
 
 The host side of native UDP sockets for pages opened in the iroh link apps
-([Android](../iroh-link-android/README.md) and
-[desktop](../iroh-link-desktop/README.md)). A page asks
+([Android](../android/README.md) and
+[desktop](../desktop/README.md)). A page asks
 `window.irohHost.udp` for a session, the app asks the user, and then every
 socket is one WebSocket to the gateway origin, speaking
-[`iroh-link-udp-proto`](../iroh-link-udp-proto/README.md). Access is off by
+[`iroh-link-udp-proto`](../udp-proto/README.md). Access is off by
 default and granted per origin, once or always.
 
 The crate provides the WebSocket route, the session and permission store, and

@@ -1,5 +1,5 @@
 // Checks js/codec.js against testdata/vectors.json (written by the Rust test
-// tests/vectors.rs). Run: node iroh-link-udp-proto/js/codec.test.mjs
+// tests/vectors.rs). Run: node udp-proto/js/codec.test.mjs
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";

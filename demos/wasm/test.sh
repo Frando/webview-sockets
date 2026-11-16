@@ -8,7 +8,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 host_port=47931
 echo_port=47932
-run="$repo/iroh-link-udp-host/examples/test-page/run-chrome.mjs"
+run="$repo/udp-host/examples/test-page/run-chrome.mjs"
 [ -f "$here/public/wasm/iroh_link_udp_demo_wasm_bg.wasm" ] || { echo "run ./build.sh first" >&2; exit 1; }
 
 (cd "$repo/iroh-link-udp-demo" && cargo build -q)

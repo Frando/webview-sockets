@@ -5,14 +5,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
-repository.workspace = true
 publish = false
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 data-encoding.workspace = true
-iroh-link-udp-proto = { path = "../iroh-link-udp-proto" }
+iroh-link-udp-proto = { path = "../udp-proto" }
 n0-error.workspace = true
 netdev = "0.46"
 noq-udp = "1.3"

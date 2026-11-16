@@ -22,7 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const codec = (await import(path.join(here, "../../../iroh-link-udp-proto/js/codec.js"))).default;
+const codec = (await import(path.join(here, "../../../udp-proto/js/codec.js"))).default;
 
 const TOKEN = "ab".repeat(32);
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";

@@ -1,10 +1,10 @@
 # iroh-link-udp-demo
 
 Demo pages for native UDP in the iroh link apps
-([Android](../iroh-link-android/README.md),
-[desktop](../iroh-link-desktop/README.md)). Publish a directory with
+([Android](../android/README.md),
+[desktop](../desktop/README.md)). Publish a directory with
 `publish-dir` and open its link in an app, or serve it locally with the
-`test-host` example of [`iroh-link-udp-host`](../iroh-link-udp-host/README.md).
+`test-host` example of [`iroh-link-udp-host`](../udp-host/README.md).
 This directory is its own Cargo workspace, excluded from the main one, and so
 are `wasm/` and `iroh/`, since they build for `wasm32-unknown-unknown` with
 their own cfgs (see their `.cargo/config.toml`).
