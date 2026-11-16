@@ -240,9 +240,10 @@ same benchmark on an idle machine reached 55-63k pkt/s for the fast API
   (below 1024) or multicast addresses. Loopback and private addresses are
   allowed. A page with a grant can reach the local network, and the prompt
   should say so.
-- **Resource limits.** `Limits` caps sockets per origin and per token,
-  message size, queued datagrams and kernel buffer sizes, and puts timeouts
-  on the handshake and name resolution.
+- **Resource limits.** `Limits` caps sockets per tab (16 by default) and,
+  as a safety cap, per origin across all tabs (64), plus message size,
+  queued datagrams and kernel buffer sizes, and puts timeouts on the
+  handshake and name resolution.
 
 The page's own JavaScript is trusted with the sockets once the user allowed
 its origin. That is the same trust model as Direct Sockets, so grant only

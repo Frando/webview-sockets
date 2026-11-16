@@ -643,15 +643,11 @@ impl UdpHost {
             ));
         }
         let tab = ticket.tab;
-        let per_token = state
-            .sessions
-            .values()
-            .filter(|s| &s.token == token)
-            .count();
-        if per_token >= limits.max_sockets_per_token {
+        let per_tab = state.sessions.values().filter(|s| s.tab == tab).count();
+        if per_tab >= limits.max_sockets_per_tab {
             return Err(Reject::new(
                 ErrorCode::Limit,
-                "too many sockets for this session",
+                "too many sockets for this tab",
             ));
         }
         let per_origin = state
@@ -673,7 +669,6 @@ impl UdpHost {
             SessionEntry {
                 origin: origin.to_string(),
                 tab,
-                token: *token,
                 close: Some(close_tx),
             },
         );

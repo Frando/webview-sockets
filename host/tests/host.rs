@@ -600,21 +600,30 @@ async fn allow_once_scope() {
 }
 
 #[tokio::test]
-async fn ninth_socket_rejected() {
-    let env = Env::new().await;
+async fn per_tab_limit() {
+    let env = Env::with_limits(Limits {
+        max_sockets_per_tab: 4,
+        ..Default::default()
+    })
+    .await;
     let token = env.token("app", 1);
     let mut open = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..4 {
         open.push(env.bound("app", token).await.0);
     }
     let (mut ws, reply) = env.open("app", token, "0.0.0.0:0").await;
     assert!(matches!(reply, Reply::Error(ErrorCode::Limit, _)));
     assert_eq!(close_code_of(&mut ws).await, close_code::LIMIT);
 
-    // The per-origin limit also applies across tabs.
+    // The limit counts all origins in the tab.
+    let other_origin = env.token("other", 1);
+    let (_, reply) = env.open("other", other_origin, "0.0.0.0:0").await;
+    assert!(matches!(reply, Reply::Error(ErrorCode::Limit, _)));
+
+    // Another tab of the same origin is not affected.
     let other_tab = env.token("app", 2);
     let (_, reply) = env.open("app", other_tab, "0.0.0.0:0").await;
-    assert!(matches!(reply, Reply::Error(ErrorCode::Limit, _)));
+    assert!(matches!(reply, Reply::Bound(_)));
 
     // Closing one frees a slot.
     let mut first = open.remove(0);
@@ -623,6 +632,84 @@ async fn ninth_socket_rejected() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let (_, reply) = env.open("app", token, "0.0.0.0:0").await;
     assert!(matches!(reply, Reply::Bound(_)));
+}
+
+#[tokio::test]
+async fn per_origin_cap_across_tabs() {
+    let env = Env::with_limits(Limits {
+        max_sockets_per_tab: 2,
+        max_sockets_per_origin: 5,
+        ..Default::default()
+    })
+    .await;
+    let mut open = Vec::new();
+    for tab in 1..=3 {
+        let token = env.token("app", tab);
+        for _ in 0..2 {
+            match env.open("app", token, "0.0.0.0:0").await {
+                (ws, Reply::Bound(_)) => open.push(ws),
+                (_, Reply::Error(code, _)) => {
+                    assert_eq!((tab, code), (3, ErrorCode::Limit));
+                }
+            }
+        }
+    }
+    assert_eq!(open.len(), 5);
+    // Other origins have their own cap.
+    let token = env.token("other", 4);
+    let (_, reply) = env.open("other", token, "0.0.0.0:0").await;
+    assert!(matches!(reply, Reply::Bound(_)));
+}
+
+/// Many tabs of one origin, two sockets each (like the iroh demo), stay
+/// within the default limits, and closing or navigating a tab frees its
+/// sockets at once.
+#[tokio::test]
+async fn tab_close_and_navigation_free_sockets() {
+    let env = Env::with_limits(Limits {
+        max_sockets_per_origin: 12,
+        ..Default::default()
+    })
+    .await;
+    let mut tabs = Vec::new();
+    for tab in 1..=6 {
+        let token = env.token("app", tab);
+        let a = env.bound("app", token).await.0;
+        let b = env.bound("app", token).await.0;
+        tabs.push((tab, token, a, b));
+    }
+    assert_eq!(env.host.active_tabs().borrow().len(), 6);
+    let extra = env.token("app", 7);
+    let (_, reply) = env.open("app", extra, "0.0.0.0:0").await;
+    assert!(matches!(reply, Reply::Error(ErrorCode::Limit, _)));
+
+    // Close tab 1 and navigate tab 2: their sockets close and the slots are
+    // free right away, without waiting for the page to notice.
+    let (_, _, mut a1, mut b1) = tabs.remove(0);
+    let (_, t2, mut a2, mut b2) = tabs.remove(0);
+    env.host.tab_closed(TabId(1));
+    env.host.tab_navigated(TabId(2));
+    assert_eq!(
+        *env.host.active_tabs().borrow(),
+        (3..=6).map(TabId).collect()
+    );
+    let extra = env.token("app", 7);
+    for _ in 0..4 {
+        let (_, reply) = env.open("app", extra, "0.0.0.0:0").await;
+        assert!(matches!(reply, Reply::Bound(_)));
+    }
+    for ws in [&mut a1, &mut b1, &mut a2, &mut b2] {
+        assert_eq!(close_code_of(ws).await, close_code::NAVIGATED);
+    }
+    // The navigated tab's old token is gone.
+    let (_, reply) = env.open("app", t2, "0.0.0.0:0").await;
+    assert!(matches!(reply, Reply::Error(ErrorCode::NotAllowed, _)));
+
+    // Closing every tab leaves nothing active.
+    for tab in 1..=7 {
+        env.host.tab_closed(TabId(tab));
+    }
+    assert!(env.host.active_tabs().borrow().is_empty());
 }
 
 #[tokio::test]

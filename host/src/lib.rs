@@ -50,10 +50,17 @@ pub struct TabId(pub u64);
 /// Resource limits for pages using UDP.
 #[derive(Debug, Clone)]
 pub struct Limits {
+    /// Maximum concurrent sockets per tab, across all origins in it.
+    ///
+    /// This is the limit a page normally hits. Sockets of a tab are closed
+    /// when it navigates or closes ([`UdpHost::tab_navigated`],
+    /// [`UdpHost::tab_closed`]).
+    pub max_sockets_per_tab: usize,
     /// Maximum concurrent sockets per origin, across all tabs.
+    ///
+    /// A safety cap for an origin open in many tabs; keep it well above
+    /// [`Self::max_sockets_per_tab`].
     pub max_sockets_per_origin: usize,
-    /// Maximum concurrent sockets per session token.
-    pub max_sockets_per_token: usize,
     /// Maximum size of one WebSocket message in bytes.
     pub max_message_len: usize,
     /// Number of received WebSocket messages (each up to 64 KiB) queued per
@@ -71,8 +78,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_sockets_per_origin: 8,
-            max_sockets_per_token: 8,
+            max_sockets_per_tab: 16,
+            max_sockets_per_origin: 64,
             max_message_len: webview_sockets_proto::MAX_MESSAGE_LEN,
             recv_queue_len: 64,
             hello_timeout: Duration::from_secs(5),
@@ -185,7 +192,6 @@ struct TicketInfo {
 struct SessionEntry {
     origin: String,
     tab: TabId,
-    token: Token,
     close: Option<oneshot::Sender<u16>>,
 }
 
@@ -285,6 +291,7 @@ impl UdpHost {
                 state.stored.grants.insert(origin.to_string(), Grant::Block);
                 self.save(&state);
                 state.drop_where(|o, _| o == origin, close_code::REVOKED);
+                self.inner.update_active(&state);
                 None
             }
         }
@@ -310,6 +317,7 @@ impl UdpHost {
         if !on {
             state.once.clear();
             state.drop_where(|_, _| true, close_code::SETTING_OFF);
+            self.inner.update_active(&state);
         }
     }
 
@@ -335,12 +343,14 @@ impl UdpHost {
         }
         state.once.retain(|(o, _)| o != origin);
         state.drop_where(|o, _| o == origin, close_code::REVOKED);
+        self.inner.update_active(&state);
     }
 
     /// Call when the tab's main frame navigates (including reloads).
     ///
     /// Ends "allow once", invalidates the tab's tickets and closes its
-    /// sockets.
+    /// sockets. The sockets no longer count towards [`Limits`] once this
+    /// returns.
     pub fn tab_navigated(&self, tab: TabId) {
         self.end_tab(tab);
     }
@@ -359,6 +369,7 @@ impl UdpHost {
         let mut state = self.inner.lock();
         state.once.retain(|(_, t)| *t != tab);
         state.drop_where(|_, t| t == tab, close_code::NAVIGATED);
+        self.inner.update_active(&state);
     }
 
     fn origin_ok(&self, origin: &str) -> bool {
@@ -417,15 +428,21 @@ impl State {
     }
 
     /// Invalidates matching tickets and closes matching sessions with `code`.
+    ///
+    /// The sessions are removed right away, so they no longer count towards
+    /// the limits while their tasks wind down. Call
+    /// [`Inner::update_active`] afterwards.
     fn drop_where(&mut self, pred: impl Fn(&str, TabId) -> bool, code: u16) {
         self.tickets.retain(|_, t| !pred(&t.origin, t.tab));
-        for s in self.sessions.values_mut() {
-            if pred(&s.origin, s.tab)
-                && let Some(close) = s.close.take()
-            {
+        self.sessions.retain(|_, s| {
+            if !pred(&s.origin, s.tab) {
+                return true;
+            }
+            if let Some(close) = s.close.take() {
                 close.send(code).ok();
             }
-        }
+            false
+        });
     }
 }
 
