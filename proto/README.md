@@ -1,7 +1,7 @@
 # webview-sockets-proto
 
-The wire format between a web page and the host app for native UDP
-sockets. One WebSocket on `/.well-known/webview-sockets/udp` of the page's
+The wire format of webview-sockets, between a web page and the app that
+hosts it, for native UDP sockets. One WebSocket on `/.well-known/webview-sockets/udp` of the page's
 own origin carries one UDP socket: the page sends `HELLO`, the host answers
 `BOUND` or `ERROR`, then both sides exchange `DATA` messages holding one or
 more datagrams. The crate is `no_std` and decodes without copying.
@@ -42,6 +42,16 @@ may send ERROR for a failed send; the socket stays open. Host close codes:
 The JavaScript codec uses the Direct Sockets names in HELLO and BOUND, e.g.
 `encodeHello(token, { remoteAddress: "example.com", remotePort: 53 })`, and
 encodes a DATA record whose `address` is not an IP literal as DATA_NAMED.
+Pages normally do not use it directly: the `UDPSocket` that
+`webview-sockets-host` injects embeds it.
+
+## Session tokens
+
+The token in HELLO comes from the platform bridge, not from this protocol:
+the page asks with `{"ns": "webview-sockets", "id": 1, "op": "requestSession"}`
+and the app answers `{"id": 1, "ok": true, "url": "ws://.../.well-known/webview-sockets/udp",
+"token": "<64 hex chars>"}` or `{"id": 1, "ok": false, "error": "NotAllowed"}`.
+See `webview-sockets-host`.
 
 The same codec exists in JavaScript in [`js/codec.js`](js/codec.js), and both
 implementations are checked against the shared test vectors in
