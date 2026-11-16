@@ -8,8 +8,9 @@
 //! [`webview_sockets_proto`].
 //!
 //! The script injected into pages ([`UdpHost::injected_js`], [`INJECTED_JS`])
-//! gives them the Direct Sockets `UDPSocket`: bound to a local address, or
-//! connected to a remote host name or address that the host resolves. Its
+//! gives them `webviewSockets.udp` and a Direct Sockets `UDPSocket` layer:
+//! sockets bound to a local address, or connected to a remote host name or
+//! address that the host resolves. Its
 //! permission step asks the platform bridge ([`BridgeRequest`],
 //! [`bridge_reply`], [`reply_script`]).
 //!

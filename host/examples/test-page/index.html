@@ -2,13 +2,14 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>UDPSocket self test</title>
+<title>webview-sockets self test</title>
 <style>body { font-family: monospace; margin: 1em; } pre { white-space: pre-wrap; }</style>
 </head>
 <body>
-<h1>UDPSocket self test</h1>
-<p>Checks the webview-sockets <code>UDPSocket</code> (Direct Sockets API) on
-loopback: bound and connected mode, GSO, host names, errors and close.
+<h1>webview-sockets self test</h1>
+<p>Checks <code>webviewSockets.udp</code> and the <code>UDPSocket</code>
+compatibility layer (Direct Sockets API) on loopback: bound and connected
+mode, GSO, GRO, host names, errors and close.
 Optional: <code>?peer=ip:port&amp;send=text&amp;expect=text</code> also sends
 to an external echo server. <code>?denied=1</code> only checks that opening
 fails with NotAllowedError (run the test-host without
@@ -77,6 +78,61 @@ fails with NotAllowedError (run the test-host without
       return;
     }
 
+    // ---- webviewSockets.udp (fast API) ----
+    const collect = (sock, n) => new Promise((resolve) => {
+      const got = [];
+      sock.onmessage = (m) => {
+        got.push({ ...m, data: m.data.slice() });
+        if (got.length === n) resolve(got);
+      };
+    });
+    {
+      const fa = await webviewSockets.udp.bind();
+      const fb = await webviewSockets.udp.bind({ localAddress: "127.0.0.1" });
+      log(`fast a: ${fa.localAddress}:${fa.localPort} gso=${fa.maxGsoSegments} gro=${fa.groSegments}`);
+      let p = collect(fb, 1);
+      fa.send("hello", "127.0.0.1", fb.localPort);
+      let got = await withTimeout(p, 3000, "fast single");
+      assert(dec.decode(got[0].data) === "hello" && got[0].port === fa.localPort, "fast single datagram");
+      p = collect(fb, 5);
+      fa.send(new Uint8Array(440), "127.0.0.1", fb.localPort, { segmentSize: 100 });
+      got = await withTimeout(p, 3000, "fast gso");
+      assert(got.map((m) => m.data.length).join(",") === "100,100,100,100,40", "fast gso sizes");
+      p = collect(fa, 100);
+      for (let i = 0; i < 100; i++) fb.send(enc.encode(`m${i}`), "127.0.0.1", fa.localPort);
+      got = await withTimeout(p, 3000, "fast 100");
+      assert(new Set(got.map((m) => dec.decode(m.data))).size === 100, "fast 100 distinct");
+      p = collect(fb, 1);
+      fa.send("named", "localhost", fb.localPort, { dnsQueryType: "ipv4" });
+      got = await withTimeout(p, 3000, "fast named");
+      assert(dec.decode(got[0].data) === "named", "fast send to host name");
+      const ferr = new Promise((resolve) => { fa.onerror = resolve; });
+      fa.send("x", "224.0.0.1", 9);
+      const fe = await withTimeout(ferr, 3000, "fast onerror");
+      log(`fast onerror: ${fe.name} ${fe.code}: ${fe.message}`);
+      const fc = await webviewSockets.udp.connect("localhost", fb.localPort, { dnsQueryType: "ipv4" });
+      assert(fc.remoteAddress === "127.0.0.1" && fc.remotePort === fb.localPort, "fast connect info");
+      p = collect(fb, 1);
+      fc.send("from fc");
+      got = await withTimeout(p, 3000, "fast connected send");
+      assert(dec.decode(got[0].data) === "from fc", "fast connected payload");
+      p = collect(fc, 1);
+      fb.send("to fc", got[0].address, got[0].port);
+      got = await withTimeout(p, 3000, "fast connected recv");
+      assert(dec.decode(got[0].data) === "to fc", "fast connected receive");
+      let bindErr = null;
+      try { await webviewSockets.udp.bind({ localAddress: "127.0.0.1", localPort: fb.localPort }); } catch (e) { bindErr = e.name; }
+      assert(bindErr === "NetworkError", `fast bind in use: ${bindErr}`);
+      const fclosed = new Promise((resolve) => { fb.onclose = resolve; });
+      fb.close();
+      const ev = await withTimeout(fclosed, 3000, "fast close");
+      assert(ev.code === 1000 && !ev.error, "fast close event");
+      fa.close();
+      fc.close();
+      log("fast API ok");
+    }
+
+    // ---- UDPSocket ----
     // Constructor checks (sync).
     let threw = null;
     try { new UDPSocket({ remotePort: 9 }); } catch (err) { threw = err.name; }

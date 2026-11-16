@@ -61,10 +61,10 @@ const HOSTS_LINE: &str = "const HOSTS = null; // @@webview-sockets-hosts@@";
 
 /// The classic script to inject into the app's pages at document start.
 ///
-/// In the top frame of http(s) pages it defines `window.UDPSocket`, the
-/// Direct Sockets `UDPSocket` (unless the browser has a native one), and
-/// `window.webviewSockets` with `version`, `UDPSocket` and
-/// `requestSession()`. This variant runs on every host; see
+/// In the top frame of http(s) pages it defines `window.webviewSockets`
+/// with `version`, `udp.bind()`, `udp.connect()`, `UDPSocket` and
+/// `requestSession()`, and `window.UDPSocket`, a Direct Sockets
+/// compatibility layer, unless the browser has a native one. This variant runs on every host; see
 /// [`injected_js_for`] for one limited to some hosts. It talks to the
 /// platform over `window.webviewSocketsBridge` (Android web message
 /// listener) or `window.ipc.postMessage` (desktop, replies via
@@ -105,6 +105,7 @@ mod tests {
         assert!(INJECTED_JS.contains("const webviewSocketsCodec"));
         assert!(INJECTED_JS.contains("requestSession"));
         assert!(INJECTED_JS.contains("class UDPSocket"));
+        assert!(INJECTED_JS.contains("udp = Object.freeze({ bind, connect })"));
         assert!(!INJECTED_JS.contains(CODEC_MARKER));
         assert!(!INJECTED_JS.contains("\nexport "));
         assert!(INJECTED_JS.is_ascii());

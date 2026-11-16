@@ -4,11 +4,12 @@ Demo pages for webview-sockets. They run in an app that embeds
 [`webview-sockets-host`](../host/README.md), or in a normal browser through
 the host's `test-host` example.
 
-- [`js/`](js): plain JavaScript on the Direct Sockets API. It opens a bound
-  socket with `new UDPSocket({ localAddress: "::" })`, shows the bound and
-  interface addresses, sends to a peer, and has an echo mode. It also opens
-  connected sockets by host name
-  (`new UDPSocket({ remoteAddress, remotePort, dnsQueryType })`).
+- [`js/`](js): plain JavaScript on `webviewSockets.udp`. It binds a
+  socket (`udp.bind({ localAddress: "::" })`), shows the bound and interface
+  addresses, sends to a peer, and has an echo mode. It also opens connected
+  sockets by host name (`udp.connect(host, port, { dnsQueryType })`). With
+  `?api=udpsocket`, the same page runs on the Direct Sockets `UDPSocket`
+  layer, which is useful for comparing the two.
 - [`wasm/`](wasm): the same in Rust, with
   [`webview-sockets`](../webview-sockets/README.md) compiled to wasm. It has
   its own Cargo workspace, which the main one excludes, because it builds
@@ -34,6 +35,7 @@ in the console and the page title:
   echo server. In the wasm demo, `&gso=1` sends each window refill as one
   segmented send.
 - `?echo=1`: starts in echo mode.
+- `?api=udpsocket` (JS): uses `new UDPSocket(...)` for all of the above.
 
 ## Build and test
 

@@ -1,30 +1,29 @@
-// webview-sockets page API: a Direct Sockets UDPSocket for webview pages.
+// webview-sockets page API: native UDP sockets for webview pages.
 //
 // The host app injects this at document start into the pages it serves. In
-// the top frame of http(s) pages on the hosts the app enables it defines:
+// the top frame of http(s) pages on the hosts the app enables it defines
+// window.webviewSockets:
 //
-// - window.UDPSocket: the Direct Sockets UDPSocket
-//   (https://wicg.github.io/direct-sockets/), only if the browser has no
-//   native one. Sockets live in the host app; each one is a WebSocket to
-//   the page's own origin.
-// - window.webviewSockets: { version, UDPSocket, requestSession() }. The
-//   polyfill class is there even if a native UDPSocket exists.
-//   requestSession() -> Promise<{ url, token }> asks the host for a session
-//   (it may prompt the user); new UDPSocket() does this itself. It is for
-//   code that speaks the wire protocol directly, like the Rust crate
-//   webview-sockets.
+//   webviewSockets.udp.bind({ localAddress = "0.0.0.0", localPort = 0,
+//       ipv6Only?, sendBufferSize?, receiveBufferSize?, gro? })
+//     -> Promise<Socket>
+//   webviewSockets.udp.connect(host, port, { dnsQueryType?, sendBufferSize?,
+//       receiveBufferSize?, gro? })
+//     -> Promise<Socket>   (host may be a name; the app resolves it)
+//   webviewSockets.requestSession() -> Promise<{ url, token }>
+//   webviewSockets.UDPSocket          Direct Sockets compatibility class
 //
-// Non-standard extensions (absent from Direct Sockets):
-// - constructor option `gro: true`: a readable chunk may hold several
-//   datagrams from the same source, each `segmentSize` bytes except the last.
-// - written messages may set `segmentSize` (GSO: `data` holds several
-//   datagrams of that size, the last may be shorter) and `ecn` (0-3).
-// - read messages carry `ecn` when it is not 0.
-// - open info has `interfaceAddresses` ([{ address, port }]),
-//   `maxGsoSegments` and `groSegments`.
-// - `socket.onsenderror`: called with a DOMException when the host fails to
-//   send a datagram after the write resolved (e.g. a host name that does not
-//   resolve). The socket stays open. Without a handler it is logged.
+// Socket: localAddress, localPort, remoteAddress, remotePort (connected),
+// interfaceAddrs, maxGsoSegments, groSegments, closed, bufferedAmount,
+// send(data, address?, port?, { segmentSize?, ecn?, dnsQueryType? }), close(),
+// onmessage({ data, address, port, ecn, segmentSize? }),
+// onerror({ name, code, message }) for failed sends (socket stays open),
+// onclose({ code, reason, error? }).
+//
+// It also installs window.UDPSocket, the Direct Sockets API
+// (https://wicg.github.io/direct-sockets/), if the browser has no native
+// one. It is built on the socket above with Streams and has about half its
+// throughput.
 (() => {
   "use strict";
   // Host patterns from UdpHost::injected_js(), null for any host.
@@ -236,9 +235,9 @@
     return o;
   }
 
-  // ---- errors from the host ----
+  // ---- errors ----
 
-  const OPEN_ERROR_NAMES = {
+  const ERROR_NAMES = {
     NotAllowed: "NotAllowedError",
     InvalidInput: "InvalidAccessError",
     AddrInUse: "NetworkError",
@@ -248,23 +247,321 @@
   };
 
   function frameError(frame) {
-    return domError(frame.message || frame.codeName, OPEN_ERROR_NAMES[frame.codeName] || "NetworkError");
+    const err = domError(frame.message || frame.codeName, ERROR_NAMES[frame.codeName] || "NetworkError");
+    Object.defineProperty(err, "udpCode", { value: frame.codeName });
+    return err;
   }
 
   function closeError(code, reason) {
-    const C2 = C.CLOSE_CODES;
+    const K = C.CLOSE_CODES;
     const what = {
-      [C2.REVOKED]: "socket access was revoked",
-      [C2.SETTING_OFF]: "sockets were turned off in the app settings",
-      [C2.NAVIGATED]: "the page navigated",
-      [C2.LIMIT]: "a host limit was exceeded",
-      [C2.IO_ERROR]: "the host socket failed",
+      [K.REVOKED]: "socket access was revoked",
+      [K.SETTING_OFF]: "sockets were turned off in the app settings",
+      [K.NAVIGATED]: "the page navigated",
+      [K.LIMIT]: "a host limit was exceeded",
+      [K.IO_ERROR]: "the host socket failed",
     }[code] || `connection to the host closed (${code}${reason ? ` ${reason}` : ""})`;
-    const name = code === C2.REVOKED || code === C2.SETTING_OFF ? "NotAllowedError" : "NetworkError";
+    const name = code === K.REVOKED || code === K.SETTING_OFF ? "NotAllowedError" : "NetworkError";
     return domError(what, name);
   }
 
-  // ---- UDPSocket ----
+  // ---- fast socket ----
+
+  const EMPTY = new Uint8Array(0);
+
+  class Socket {
+    constructor(ws, frame, gro) {
+      this._ws = ws;
+      this._gro = gro;
+      // Records waiting to be sent as one WebSocket message.
+      this._buf = null;
+      this._view = null;
+      this._queued = 0;
+      this._flushScheduled = false;
+      // Last destination, so repeated sends skip parsing.
+      this._lastAddress = null;
+      this._lastIp = null;
+      // Last source, so repeated receives skip formatting.
+      this._lastFrom = new Uint8Array(16);
+      this._lastFromLen = 0;
+      this._lastFromText = "";
+      this._closedByPage = false;
+      this.localAddress = frame.localAddress;
+      this.localPort = frame.localPort;
+      this.remoteAddress = frame.remoteAddress;
+      this.remotePort = frame.remotePort;
+      this.interfaceAddrs = frame.interfaceAddrs;
+      this.maxGsoSegments = frame.maxGsoSegments;
+      this.groSegments = frame.groSegments;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+      ws.onmessage = (event) => this._onMessage(event.data);
+      ws.onclose = (event) => this._onClose(event.code, event.reason);
+    }
+
+    get closed() {
+      return this._ws.readyState >= WebSocket.CLOSING;
+    }
+
+    // Bytes not yet handed to the network, for backpressure.
+    get bufferedAmount() {
+      return this._ws.bufferedAmount + this._queued;
+    }
+
+    // data: Uint8Array | ArrayBuffer | ArrayBufferView | string (UTF-8).
+    // address may be a host name (bound sockets). On a connected socket
+    // address and port may be left out. opts.segmentSize: GSO, data holds
+    // several datagrams of this size. opts.ecn: ECN bits 0-3.
+    // opts.dnsQueryType: "ipv4" | "ipv6" for a host name address.
+    send(data, address, port, opts) {
+      if (this.closed) throw domError("socket is closed", "InvalidStateError");
+      if (address === undefined || address === null) {
+        if (this.remoteAddress === null) throw new TypeError("address and port are required");
+        address = this.remoteAddress;
+        port = this.remotePort;
+      }
+      const ecn = opts && opts.ecn ? opts.ecn & 3 : 0;
+      const segmentSize = opts && opts.segmentSize ? opts.segmentSize : 0;
+      const ip = this._destIp(address);
+      if (ip && typeof data !== "string"
+        && Number.isInteger(port) && port >= 0 && port <= 0xffff
+        && Number.isInteger(segmentSize) && segmentSize <= 0xffff) {
+        const payload = data instanceof Uint8Array ? data
+          : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+            : data instanceof ArrayBuffer ? new Uint8Array(data) : null;
+        if (payload) {
+          const at = this._reserve(11 + ip.length + payload.length);
+          const buf = this._buf;
+          const view = this._view;
+          buf[at] = C.KIND_DATA;
+          buf[at + 1] = ecn;
+          buf[at + 2] = ip.length === 4 ? 4 : 6;
+          buf.set(ip, at + 3);
+          const p = at + 3 + ip.length;
+          view.setUint16(p, port);
+          view.setUint16(p + 2, segmentSize);
+          view.setUint32(p + 4, payload.length);
+          buf.set(payload, p + 8);
+          this._scheduleFlush();
+          return;
+        }
+      }
+      // Host names, strings and anything to validate: the generic encoder.
+      const bytes = C.encodeData({
+        address, port, payload: data, ecn, segmentSize, dnsQueryType: opts ? opts.dnsQueryType : undefined,
+      });
+      const at = this._reserve(bytes.length);
+      this._buf.set(bytes, at);
+      this._scheduleFlush();
+    }
+
+    close() {
+      this._flush();
+      this._closedByPage = true;
+      this._ws.close(1000);
+    }
+
+    _destIp(address) {
+      if (address !== this._lastAddress) {
+        this._lastIp = C.ipLiteral(address);
+        this._lastAddress = address;
+      }
+      return this._lastIp;
+    }
+
+    // Returns the offset of `size` free bytes in the batch buffer, sending
+    // the batch first if they do not fit.
+    _reserve(size) {
+      if (size > C.MAX_MESSAGE_LEN) {
+        throw new TypeError(`datagram of ${size} bytes exceeds ${C.MAX_MESSAGE_LEN} bytes`);
+      }
+      if (this._queued + size > C.MAX_MESSAGE_LEN) this._flush();
+      if (!this._buf) {
+        this._buf = new Uint8Array(C.MAX_MESSAGE_LEN);
+        this._view = new DataView(this._buf.buffer);
+      }
+      const at = this._queued;
+      this._queued += size;
+      return at;
+    }
+
+    // Sends everything queued in this task as one message, in a microtask.
+    _scheduleFlush() {
+      if (this._flushScheduled) return;
+      this._flushScheduled = true;
+      queueMicrotask(() => this._flush());
+    }
+
+    _flush() {
+      this._flushScheduled = false;
+      if (this._queued === 0) return;
+      const total = this._queued;
+      this._queued = 0;
+      // send() copies the bytes, so the buffer is reused.
+      if (this._ws.readyState === WebSocket.OPEN) this._ws.send(this._buf.subarray(0, total));
+    }
+
+    _onMessage(data) {
+      const bytes = new Uint8Array(data);
+      if (bytes[0] === C.KIND_ERROR) {
+        let err;
+        try {
+          err = frameError(C.decodeFirst(bytes));
+        } catch {
+          return this._protocolError();
+        }
+        if (this.onerror) this.onerror({ name: err.name, code: err.udpCode, message: err.message, error: err });
+        else console.warn(`webviewSockets.udp: send failed: ${err.udpCode}: ${err.message}`);
+        return;
+      }
+      try {
+        this._receive(bytes);
+      } catch (err) {
+        if (err instanceof ProtocolError) this._protocolError();
+        else throw err;
+      }
+    }
+
+    // Delivers the datagrams of a DATA message. Payloads are zero-copy views.
+    _receive(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const end = bytes.length;
+      const gro = this._gro;
+      let pos = 0;
+      // Check the whole message before delivering any of it.
+      while (pos < end) {
+        const family = bytes[pos + 2];
+        const ipLen = family === 4 ? 4 : family === 6 ? 16 : 0;
+        if (bytes[pos] !== C.KIND_DATA || !ipLen || bytes[pos + 1] > 3) throw new ProtocolError();
+        const head = pos + 3 + ipLen + 8;
+        if (head > end) throw new ProtocolError();
+        pos = head + view.getUint32(head - 4);
+        if (pos > end) throw new ProtocolError();
+      }
+      pos = 0;
+      while (pos < end) {
+        const ecn = bytes[pos + 1];
+        const ipAt = pos + 3;
+        const ipLen = bytes[pos + 2] === 4 ? 4 : 16;
+        const p = ipAt + ipLen;
+        const port = view.getUint16(p);
+        const segmentSize = view.getUint16(p + 2);
+        const len = view.getUint32(p + 4);
+        const start = p + 8;
+        pos = start + len;
+        const onmessage = this.onmessage;
+        if (!onmessage) continue;
+        const address = this._fromText(bytes, ipAt, ipLen);
+        if (gro || !segmentSize || len <= segmentSize) {
+          const msg = { data: len ? bytes.subarray(start, start + len) : EMPTY, address, port, ecn };
+          if (gro && segmentSize && len > segmentSize) msg.segmentSize = segmentSize;
+          onmessage(msg);
+        } else {
+          for (let off = 0; off < len; off += segmentSize) {
+            onmessage({ data: bytes.subarray(start + off, start + Math.min(off + segmentSize, len)), address, port, ecn });
+          }
+        }
+      }
+    }
+
+    _fromText(bytes, at, len) {
+      const last = this._lastFrom;
+      let same = len === this._lastFromLen;
+      for (let i = 0; same && i < len; i++) same = bytes[at + i] === last[i];
+      if (!same) {
+        const ip = bytes.subarray(at, at + len);
+        last.set(ip);
+        this._lastFromLen = len;
+        this._lastFromText = len === 4 ? `${ip[0]}.${ip[1]}.${ip[2]}.${ip[3]}` : C.formatIpv6(ip);
+      }
+      return this._lastFromText;
+    }
+
+    _protocolError() {
+      console.warn("webviewSockets.udp: bad message from host");
+      this._ws.close(1002);
+    }
+
+    _onClose(code, reason) {
+      const handler = this.onclose;
+      if (!handler) return;
+      const event = { code, reason };
+      if (!this._closedByPage) event.error = code === 1002 ? domError("bad message from host", "NetworkError") : closeError(code, reason);
+      handler(event);
+    }
+  }
+
+  class ProtocolError extends Error {}
+
+  // Opens a socket from HELLO options (codec names). Retries once with a
+  // fresh session if the token went stale.
+  async function open(helloOptions, gro) {
+    for (let attempt = 0; ; attempt++) {
+      const s = await getSession();
+      const hello = C.encodeHello(s.token, helloOptions);
+      const result = await handshake(s.url, hello);
+      if (result.ws) return new Socket(result.ws, result.frame, gro);
+      if (result.stale && attempt === 0) {
+        session = null;
+        continue;
+      }
+      throw result.error;
+    }
+  }
+
+  // Opens the WebSocket, sends HELLO and waits for BOUND or ERROR.
+  function handshake(url, hello) {
+    return new Promise((resolve) => {
+      const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => ws.send(hello);
+      ws.onerror = () => {};
+      ws.onclose = (event) => {
+        resolve({ error: domError(`connection to the host closed (${event.code})`, "NetworkError") });
+      };
+      ws.onmessage = (event) => {
+        ws.onclose = null;
+        ws.onmessage = null;
+        let frame;
+        try {
+          frame = C.decodeFirst(new Uint8Array(event.data));
+        } catch (err) {
+          ws.close(1002);
+          resolve({ error: domError(`bad reply from host: ${err.message}`, "NetworkError") });
+          return;
+        }
+        if (frame.kind === "bound") {
+          resolve({ ws, frame });
+        } else {
+          ws.close();
+          resolve({ error: frameError(frame), stale: frame.codeName === "NotAllowed" });
+        }
+      };
+    });
+  }
+
+  function bind(options = {}) {
+    return open({
+      localAddress: options.localAddress ?? options.address ?? "0.0.0.0",
+      localPort: options.localPort ?? options.port ?? 0,
+      ipv6Only: options.ipv6Only,
+      sendBufferSize: options.sendBufferSize,
+      receiveBufferSize: options.receiveBufferSize,
+    }, Boolean(options.gro));
+  }
+
+  function connect(host, port, options = {}) {
+    return open({
+      remoteAddress: host,
+      remotePort: port,
+      dnsQueryType: options.dnsQueryType,
+      sendBufferSize: options.sendBufferSize,
+      receiveBufferSize: options.receiveBufferSize,
+    }, Boolean(options.gro));
+  }
+
+  // ---- Direct Sockets UDPSocket, on top of the fast socket ----
 
   // Datagrams queued in the readable before further ones are dropped.
   const RECV_QUEUE_LEN = 4096;
@@ -272,9 +569,6 @@
   const SEND_HIGH = 1024 * 1024;
   // ... until the backlog is below this.
   const SEND_LOW = 256 * 1024;
-  // Microtask hops without a new write before queued writes are sent as one
-  // WebSocket message. WritableStream calls the sink a few microtasks apart.
-  const FLUSH_IDLE_HOPS = 4;
 
   function deferred() {
     let resolve, reject;
@@ -290,115 +584,58 @@
     else d.reject(value);
   }
 
-  // Connection state of one socket, kept out of the public object.
+  // State of one UDPSocket, kept out of the public object.
   class Conn {
     constructor(socket, opts) {
       this.socket = socket;
       this.opts = opts;
       this.opened = deferred();
       this.closed = deferred();
-      this.ws = null;
-      this.remote = null; // { address, port } in connected mode
-      // Records waiting to be sent as one WebSocket message.
-      this.buf = null;
-      this.view = null;
-      this.queued = 0;
-      this.flushing = false;
-      // Last destination, so repeated sends skip parsing.
-      this.lastAddress = null;
-      this.lastIp = null;
-      // Last source, so repeated receives skip formatting.
-      this.lastFrom = new Uint8Array(16);
-      this.lastFromLen = 0;
-      this.lastFromText = "";
-      this.writeSeq = 0;
-      this.readDone = false;
-      this.writeDone = false;
-      this.rc = null; // ReadableStreamDefaultController
-      this.wc = null; // WritableStreamDefaultController
+      this.sock = null;
       this.readable = null;
       this.writable = null;
-      this.error = null;
+      this.rc = null;
+      this.wc = null;
+      this.readDone = false;
+      this.writeDone = false;
       this.writeError = null;
+      this.error = null;
     }
 
     async open() {
-      for (let attempt = 0; ; attempt++) {
-        let s;
-        try {
-          s = await getSession();
-        } catch (err) {
-          return this.failOpen(err);
-        }
-        let hello;
-        try {
-          hello = C.encodeHello(s.token, this.opts.connected ? {
-            remoteAddress: this.opts.remoteAddress, remotePort: this.opts.remotePort,
-            dnsQueryType: this.opts.dnsQueryType,
-            sendBufferSize: this.opts.sendBufferSize, receiveBufferSize: this.opts.receiveBufferSize,
-          } : {
-            localAddress: this.opts.localAddress, localPort: this.opts.localPort ?? 0,
-            ipv6Only: this.opts.ipv6Only,
-            sendBufferSize: this.opts.sendBufferSize, receiveBufferSize: this.opts.receiveBufferSize,
-          });
-        } catch (err) {
-          return this.failOpen(new TypeError(err.message));
-        }
-        const result = await this.connect(s.url, hello);
-        if (result.ok) return this.onOpen(result.ws, result.frame);
-        // A stale token (revoked, setting toggled): get a new session once.
-        if (result.stale && attempt === 0) {
-          session = null;
-          continue;
-        }
-        return this.failOpen(result.error);
+      const o = this.opts;
+      let sock;
+      try {
+        sock = o.connected
+          ? await connect(o.remoteAddress, o.remotePort, o)
+          : await bind({ ...o, localPort: o.localPort ?? 0 });
+      } catch (err) {
+        this.error = err.name === "UdpCodecError" ? new TypeError(err.message) : err;
+        settle(this.opened, false, this.error);
+        settle(this.closed, false, this.error);
+        return;
       }
-    }
-
-    // Opens the WebSocket and sends HELLO. Resolves with
-    // { ok: true, ws, frame } or { ok: false, error, stale }.
-    connect(url, hello) {
-      return new Promise((resolve) => {
-        const ws = new WebSocket(url);
-        ws.binaryType = "arraybuffer";
-        ws.onopen = () => ws.send(hello);
-        ws.onerror = () => {};
-        ws.onclose = (event) => {
-          resolve({ ok: false, error: domError(`connection to the host closed (${event.code})`, "NetworkError") });
-        };
-        ws.onmessage = (event) => {
-          ws.onclose = null;
-          ws.onmessage = null;
-          let frame;
-          try {
-            frame = C.decodeFirst(new Uint8Array(event.data));
-          } catch (err) {
-            ws.close(1002);
-            resolve({ ok: false, error: domError(`bad reply from host: ${err.message}`, "NetworkError") });
-            return;
-          }
-          if (frame.kind === "bound") {
-            resolve({ ok: true, ws, frame });
-          } else {
-            ws.close();
-            resolve({ ok: false, error: frameError(frame), stale: frame.codeName === "NotAllowed" });
-          }
-        };
-      });
-    }
-
-    failOpen(err) {
-      this.error = err;
-      settle(this.opened, false, err);
-      settle(this.closed, false, err);
-    }
-
-    onOpen(ws, frame) {
-      this.ws = ws;
-      const connected = this.opts.connected;
-      if (connected) this.remote = { address: frame.remoteAddress, port: frame.remotePort };
-      ws.onmessage = (event) => this.onMessage(event.data);
-      ws.onclose = (event) => this.onWsClose(event);
+      this.sock = sock;
+      const connected = o.connected;
+      sock.onmessage = (m) => {
+        const rc = this.rc;
+        if (this.readDone || rc.desiredSize <= 0) return; // reader too slow: drop
+        // Copy: chunks own their buffer, so a reader may transfer it.
+        const msg = { data: m.data.slice() };
+        if (!connected) {
+          msg.remoteAddress = m.address;
+          msg.remotePort = m.port;
+        }
+        if (m.ecn) msg.ecn = m.ecn;
+        if (m.segmentSize) msg.segmentSize = m.segmentSize;
+        rc.enqueue(msg);
+      };
+      sock.onerror = (e) => {
+        const handler = this.socket.onsenderror;
+        if (typeof handler === "function") handler.call(this.socket, e.error);
+        else console.warn(`UDPSocket: send failed: ${e.name}: ${e.message}`);
+      };
+      sock.onclose = (e) => this.fail(e.error || domError("socket closed", "NetworkError"));
       this.readable = new ReadableStream({
         start: (c) => { this.rc = c; },
         cancel: () => {
@@ -428,136 +665,36 @@
           this.maybeClose();
         },
       });
-      const info = {
-        readable: this.readable,
-        writable: this.writable,
-      };
+      const info = { readable: this.readable, writable: this.writable };
       if (connected) {
-        info.remoteAddress = frame.remoteAddress;
-        info.remotePort = frame.remotePort;
+        info.remoteAddress = sock.remoteAddress;
+        info.remotePort = sock.remotePort;
       }
-      info.localAddress = frame.localAddress;
-      info.localPort = frame.localPort;
+      info.localAddress = sock.localAddress;
+      info.localPort = sock.localPort;
       // Non-standard.
-      info.interfaceAddresses = frame.interfaceAddrs;
-      info.maxGsoSegments = frame.maxGsoSegments;
-      info.groSegments = frame.groSegments;
+      info.interfaceAddresses = sock.interfaceAddrs;
+      info.maxGsoSegments = sock.maxGsoSegments;
+      info.groSegments = sock.groSegments;
       settle(this.opened, true, info);
     }
 
-    onMessage(data) {
-      const bytes = new Uint8Array(data);
-      if (C.messageKind(bytes) === C.KIND_ERROR) {
-        let frame;
-        try {
-          frame = C.decodeFirst(bytes);
-        } catch {
-          return this.protocolError();
-        }
-        const err = frameError(frame);
-        const handler = this.socket.onsenderror;
-        if (typeof handler === "function") {
-          try {
-            handler.call(this.socket, err);
-          } catch (e) {
-            console.error(e);
-          }
-        } else {
-          console.warn(`UDPSocket: send failed: ${err.name}: ${err.message}`);
-        }
-        return;
-      }
-      if (this.readDone || !this.rc) return;
-      try {
-        this.receive(bytes);
-      } catch {
-        this.protocolError();
-      }
-    }
-
-    // Enqueues the datagrams of a DATA message. Throws on a malformed one.
-    receive(bytes) {
-      const rc = this.rc;
-      const connected = this.opts.connected;
-      const gro = this.opts.gro;
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const end = bytes.length;
-      let pos = 0;
-      while (pos < end) {
-        if (bytes[pos] !== C.KIND_DATA) throw new Error("unexpected record");
-        const ecn = bytes[pos + 1];
-        const family = bytes[pos + 2];
-        const ipLen = family === 4 ? 4 : family === 6 ? 16 : 0;
-        if (!ipLen || ecn > 3) throw new Error("bad record");
-        const ipAt = pos + 3;
-        const head = ipAt + ipLen + 8;
-        if (head > end) throw new Error("truncated");
-        const remotePort = view.getUint16(ipAt + ipLen);
-        const segmentSize = view.getUint16(ipAt + ipLen + 2);
-        const len = view.getUint32(ipAt + ipLen + 4);
-        if (head + len > end) throw new Error("truncated");
-        pos = head + len;
-        let remoteAddress;
-        if (!connected) remoteAddress = this.fromText(bytes, ipAt, ipLen);
-        const step = gro || !segmentSize ? len || 1 : segmentSize;
-        for (let off = 0; off < len || (off === 0 && len === 0); off += step) {
-          if (rc.desiredSize <= 0) return; // reader too slow: drop, like a full socket buffer
-          // Copy: chunks own their buffer, so a reader may transfer it.
-          const msg = { data: bytes.slice(head + off, head + Math.min(off + step, len)) };
-          if (!connected) {
-            msg.remoteAddress = remoteAddress;
-            msg.remotePort = remotePort;
-          }
-          if (ecn) msg.ecn = ecn;
-          if (gro && segmentSize && len > segmentSize) msg.segmentSize = segmentSize;
-          rc.enqueue(msg);
-          if (len === 0) break;
-        }
-      }
-    }
-
-    // Formats a source address, reusing the last result.
-    fromText(bytes, at, len) {
-      const last = this.lastFrom;
-      let same = len === this.lastFromLen;
-      for (let i = 0; same && i < len; i++) same = bytes[at + i] === last[i];
-      if (!same) {
-        const ip = bytes.subarray(at, at + len);
-        last.set(ip);
-        this.lastFromLen = len;
-        this.lastFromText = len === 4 ? `${ip[0]}.${ip[1]}.${ip[2]}.${ip[3]}` : C.formatIpv6(ip);
-      }
-      return this.lastFromText;
-    }
-
-    protocolError() {
-      this.fail(domError("bad message from host", "NetworkError"), 1002);
-    }
-
-    onWsClose(event) {
-      if (this.closed.settled) return;
-      this.fail(closeError(event.code, event.reason));
-    }
-
     // Errors both streams and rejects `closed`.
-    fail(err, wsCode) {
+    fail(err) {
       if (this.closed.settled) return;
       this.error = err;
       this.readDone = true;
       this.writeDone = true;
       try { this.rc.error(err); } catch {}
       try { this.wc.error(err); } catch {}
-      this.queued = 0;
-      if (wsCode && this.ws.readyState < WebSocket.CLOSING) this.ws.close(wsCode);
+      if (!this.sock.closed) this.sock.close();
       settle(this.closed, false, err);
     }
 
     maybeClose() {
       if (!this.readDone || !this.writeDone || this.closed.settled) return;
-      this.flush();
-      this.ws.onclose = null;
-      this.ws.onmessage = null;
-      this.ws.close(1000);
+      this.sock.onclose = null;
+      this.sock.close();
       if (this.writeError) {
         this.error = this.writeError;
         settle(this.closed, false, this.writeError);
@@ -573,117 +710,44 @@
       if (!(data instanceof ArrayBuffer || ArrayBuffer.isView(data))) {
         throw new TypeError("data must be an ArrayBuffer or ArrayBufferView");
       }
-      const record = {
-        payload: data,
+      const extra = {
         ecn: chunk.ecn === undefined ? 0 : enforceRange("ecn", chunk.ecn, 3),
         segmentSize: chunk.segmentSize === undefined ? 0 : enforceRange("segmentSize", chunk.segmentSize, 0xffff),
       };
+      let address;
+      let port;
       if (this.opts.connected) {
         if (chunk.remoteAddress !== undefined || chunk.remotePort !== undefined || chunk.dnsQueryType !== undefined) {
           throw new TypeError("a connected socket cannot set remoteAddress, remotePort or dnsQueryType");
         }
-        record.address = this.remote.address;
-        record.port = this.remote.port;
       } else {
         if (chunk.remoteAddress === undefined || chunk.remotePort === undefined) {
           throw new TypeError("remoteAddress and remotePort are required");
         }
-        record.address = String(chunk.remoteAddress);
-        record.port = enforceRange("remotePort", chunk.remotePort, 0xffff);
-        record.dnsQueryType = dnsQueryType(chunk.dnsQueryType);
-        const ip = this.destIp(record.address);
+        address = String(chunk.remoteAddress);
+        port = enforceRange("remotePort", chunk.remotePort, 0xffff);
+        const ip = this.sock._destIp(address);
         if (ip && isMulticast(ip)) throw domError("multicast is not allowed", "NotAllowedError");
         if (ip && (isUnspecified(ip) || isBroadcast(ip))) {
-          throw domError(`destination ${record.address} is not allowed`, "NotAllowedError");
+          throw domError(`destination ${address} is not allowed`, "NotAllowedError");
         }
-        if (record.port === 0) throw domError("destination port 0 is not allowed", "NotAllowedError");
+        if (port === 0) throw domError("destination port 0 is not allowed", "NotAllowedError");
+        if (chunk.dnsQueryType !== undefined) extra.dnsQueryType = dnsQueryType(chunk.dnsQueryType);
       }
-      const ip = this.destIp(record.address);
-      if (ip) {
-        const payload = ArrayBuffer.isView(data)
-          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
-        const size = 11 + ip.length + payload.length;
-        const at = this.reserve(size);
-        const buf = this.buf;
-        const view = this.view;
-        buf[at] = C.KIND_DATA;
-        buf[at + 1] = record.ecn;
-        buf[at + 2] = ip.length === 4 ? 4 : 6;
-        buf.set(ip, at + 3);
-        const p = at + 3 + ip.length;
-        view.setUint16(p, record.port);
-        view.setUint16(p + 2, record.segmentSize);
-        view.setUint32(p + 4, payload.length);
-        buf.set(payload, p + 8);
-      } else {
-        let bytes;
-        try {
-          bytes = C.encodeData(record);
-        } catch (err) {
-          throw new TypeError(err.message);
-        }
-        this.buf.set(bytes, this.reserve(bytes.length));
+      try {
+        this.sock.send(data, address, port, extra);
+      } catch (err) {
+        throw err.name === "InvalidStateError" ? err : new TypeError(err.message);
       }
-      this.writeSeq++;
-      if (!this.flushing) {
-        this.flushing = true;
-        this.scheduleFlush(this.writeSeq, 0);
-      }
-      if (this.ws.bufferedAmount + this.queued > SEND_HIGH) return this.drained();
-      return undefined;
+      return this.backpressure();
     }
 
-    // Returns the IP bytes of a destination literal, or null for a host name.
-    destIp(address) {
-      if (address !== this.lastAddress) {
-        this.lastIp = C.ipLiteral(address);
-        this.lastAddress = address;
-      }
-      return this.lastIp;
-    }
-
-    // Returns the offset of `size` free bytes in the batch buffer, sending
-    // the batch first if they do not fit.
-    reserve(size) {
-      if (size > C.MAX_MESSAGE_LEN) {
-        throw new TypeError(`datagram of ${size} bytes exceeds ${C.MAX_MESSAGE_LEN} bytes`);
-      }
-      if (this.queued + size > C.MAX_MESSAGE_LEN) this.flush();
-      if (!this.buf) {
-        this.buf = new Uint8Array(C.MAX_MESSAGE_LEN);
-        this.view = new DataView(this.buf.buffer);
-      }
-      const at = this.queued;
-      this.queued += size;
-      return at;
-    }
-
-    // Sends once no write arrived for FLUSH_IDLE_HOPS microtasks.
-    scheduleFlush(seq, idle) {
-      queueMicrotask(() => {
-        if (!this.flushing) return;
-        if (this.writeSeq !== seq) return this.scheduleFlush(this.writeSeq, 0);
-        if (idle + 1 < FLUSH_IDLE_HOPS) return this.scheduleFlush(seq, idle + 1);
-        this.flush();
-      });
-    }
-
-    flush() {
-      this.flushing = false;
-      if (this.queued === 0) return;
-      const total = this.queued;
-      this.queued = 0;
-      // send() copies the bytes, so the buffer is reused.
-      if (this.ws.readyState === WebSocket.OPEN) this.ws.send(this.buf.subarray(0, total));
-    }
-
-    // Resolves once the WebSocket backlog drops below SEND_LOW.
-    drained() {
-      this.flush();
+    backpressure() {
+      if (this.sock.bufferedAmount <= SEND_HIGH) return undefined;
       return new Promise((resolve, reject) => {
         const check = () => {
           if (this.closed.settled) reject(this.error || domError("socket is closed", "InvalidStateError"));
-          else if (this.ws.bufferedAmount < SEND_LOW) resolve();
+          else if (this.sock.bufferedAmount < SEND_LOW) resolve();
           else setTimeout(check, 1);
         };
         check();
@@ -704,7 +768,7 @@
       const opts = parseOptions(options);
       const conn = new Conn(this, opts);
       conns.set(this, conn);
-      // Non-standard, see the top of this file.
+      // Non-standard: failed sends after the write resolved.
       this.onsenderror = null;
       conn.open();
     }
@@ -719,7 +783,7 @@
 
     close() {
       const conn = connOf(this);
-      if (!conn.opened.settled || !conn.ws) {
+      if (!conn.opened.settled || !conn.sock) {
         return Promise.reject(domError("socket is not open", "InvalidStateError"));
       }
       if (conn.closed.settled) return conn.closed.promise;
@@ -739,8 +803,9 @@
       value: UDPSocket, writable: true, configurable: true, enumerable: false,
     });
   }
+  const udp = Object.freeze({ bind, connect });
   Object.defineProperty(window, "webviewSockets", {
-    value: Object.freeze({ version: C.VERSION, UDPSocket, requestSession }),
+    value: Object.freeze({ version: C.VERSION, udp, UDPSocket, requestSession }),
     enumerable: true,
   });
 })();

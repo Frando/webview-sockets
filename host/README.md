@@ -1,7 +1,8 @@
 # webview-sockets-host
 
-The app side of webview-sockets. It gives pages in your webview the Direct
-Sockets `UDPSocket`, backed by real sockets in your app. See the
+The app side of webview-sockets. It gives pages in your webview UDP sockets
+(`webviewSockets.udp`, plus a Direct Sockets `UDPSocket` layer), backed by
+real sockets in your app. See the
 [project README](../README.md) for the design and the security model.
 
 The crate provides:
@@ -72,12 +73,16 @@ takes any rule, and `HostPolicy::Any` is for dev tools.
 
 In the top frame of http(s) pages on an allowed host, it defines:
 
-- `window.UDPSocket`, the Direct Sockets API, if the browser has none.
-- `window.webviewSockets`, which has `{ version, UDPSocket, requestSession() }`.
+- `window.webviewSockets`, which has `{ version, udp: { bind, connect },
+  UDPSocket, requestSession() }`. `udp` is the primary, fast API: socket
+  objects with `send(data, address?, port?, opts)`, `onmessage`,
+  `onerror`, `onclose` and `close()`.
+- `window.UDPSocket`, a Direct Sockets compatibility layer built on `udp`.
+  It is installed only if the browser has none, and has about half the
+  throughput.
 
-The project README lists the supported options, the error names and the
-non-standard extensions (GSO/GRO `segmentSize`, `ecn`, interface addresses,
-`onsenderror`).
+The project README documents both APIs, the error names and the
+benchmarks.
 
 ## Testing pages without an app
 

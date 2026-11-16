@@ -1,19 +1,20 @@
 # webview-sockets
 
 Real UDP sockets for web pages shown in a webview, provided by the app that
-embeds the webview. Pages use the standard
-[Direct Sockets](https://wicg.github.io/direct-sockets/) `UDPSocket` API.
-Rust code compiled to wasm gets a `std::net::UdpSocket` lookalike. The app
-owns the sockets and decides, per origin and with a user prompt, who may use
-them.
+embeds the webview. Pages get a small, fast socket API
+(`webviewSockets.udp`). For code written against the standard, there is
+also a [Direct Sockets](https://wicg.github.io/direct-sockets/)
+`UDPSocket` compatibility layer. Rust code compiled to wasm gets a
+`std::net::UdpSocket` lookalike. The app owns the sockets and decides, per
+origin and with a user prompt, who may use them.
 
 ```js
-const socket = new UDPSocket({ remoteAddress: "example.org", remotePort: 4433 });
-const { readable, writable } = await socket.opened; // may prompt the user
-const writer = writable.getWriter();
-await writer.write({ data: new TextEncoder().encode("hello") });
-const { value } = await readable.getReader().read();
-console.log(new TextDecoder().decode(value.data));
+const sock = await webviewSockets.udp.bind({ localAddress: "::" }); // may prompt the user
+sock.onmessage = ({ data, address, port }) => console.log(address, port, data);
+sock.send("hello", "203.0.113.7", 4433);
+
+const peer = await webviewSockets.udp.connect("example.org", 4433); // the app resolves the name
+peer.send(new Uint8Array([1, 2, 3]));
 ```
 
 - [Why](#why)
@@ -51,7 +52,7 @@ and in a webview.
 |  | page http://app.localhost:N |  HTTP  | app pages           | |
 |  |                             |<------>|                     | |
 |  |  injected script:           |   WS   | /.well-known/       | |
-|  |   UDPSocket  ---------------+------->|  webview-sockets/udp|--+--> UDP
+|  |   webviewSockets.udp -------+------->|  webview-sockets/udp|--+--> UDP
 |  |   (one WebSocket per socket)|        |  (UdpHost::router)  | |
 |  |                             |        +---------------------+ |
 |  |   requestSession() ---------+--> platform bridge (Android    |
@@ -65,9 +66,9 @@ and in a webview.
    `http://app.localhost:8080`, and merges `UdpHost::router()` into that
    server.
 2. At document start the app injects a script
-   (`UdpHost::injected_js()`) into its pages. It defines `UDPSocket` if the
-   browser has none, and `window.webviewSockets`.
-3. `new UDPSocket(...)` asks the app for a session over the platform
+   (`UdpHost::injected_js()`) into its pages. It defines
+   `window.webviewSockets`, and `UDPSocket` if the browser has none.
+3. The first `webviewSockets.udp.bind(...)` (or `new UDPSocket(...)`) asks the app for a session over the platform
    bridge: an Android web message listener or wry's IPC. The platform
    reports the page's real origin, which the page cannot fake. The app
    checks its policy and grants, and may prompt the user. It answers with a
@@ -85,13 +86,71 @@ check makes sure only the granted origin can use the token.
 
 ## The page API
 
-### Direct Sockets `UDPSocket`
+The injected script defines `window.webviewSockets` in the top frame of
+http(s) pages on the hosts the app allows:
 
-The injected script installs `window.UDPSocket` following the
-[Direct Sockets spec](https://wicg.github.io/direct-sockets/), only when
-the browser has no native `UDPSocket`. Code written for Isolated Web Apps
-works unchanged, and code written against webview-sockets works on Chrome's
-native implementation, as long as it skips the extensions below.
+- `udp.bind(options?)` -> `Promise<Socket>`: a bound socket. Options:
+  `localAddress` (default `"0.0.0.0"`; `"::"` is dual-stack), `localPort`
+  (default 0, any port), `ipv6Only`, `sendBufferSize`, `receiveBufferSize`,
+  `gro`.
+- `udp.connect(host, port, options?)` -> `Promise<Socket>`: a connected
+  socket. `host` is an IP address or a name that the app resolves. It only
+  talks to that peer. Options: `dnsQueryType` (`"ipv4"` or `"ipv6"`),
+  `sendBufferSize`, `receiveBufferSize`, `gro`.
+- `UDPSocket`: the Direct Sockets class, see below.
+- `requestSession()` -> `Promise<{ url, token }>`: asks the app for a
+  session, which may prompt the user. `bind`, `connect` and `UDPSocket` call
+  it as needed. It is for code that speaks the wire protocol directly, such
+  as the Rust crate, or to hand a session to a Worker.
+- `version`: the wire protocol version (2).
+
+The first socket asks for a session, so that is when the user sees the
+prompt.
+
+### Socket
+
+| Member | |
+| --- | --- |
+| `send(data, address?, port?, { segmentSize?, ecn?, dnsQueryType? })` | Queues one datagram. `data` is a `Uint8Array`, `ArrayBuffer`, other `ArrayBufferView`, or a string (sent as UTF-8). `address` may be a host name, which the app resolves. On a connected socket, leave out `address` and `port`. All sends in one task go to the app in one WebSocket message. |
+| `onmessage({ data, address, port, ecn, segmentSize? })` | One received datagram. `data` is a `Uint8Array` view into the received message. It stays valid, but copy it if you keep many. |
+| `onerror({ name, code, message, error })` | A send failed in the app, for example a forbidden destination or a name that does not resolve. The socket stays open. Without a handler, the error is logged. |
+| `onclose({ code, reason, error? })` | The socket closed. `error` is set (a `DOMException`) unless the page closed it: `NotAllowedError` when access was revoked or switched off, otherwise `NetworkError`. |
+| `close()` | Sends what is queued and closes. |
+| `localAddress`, `localPort` | The bound address. |
+| `remoteAddress`, `remotePort` | The resolved peer of a connected socket, or `null`. |
+| `interfaceAddrs` | `[{ address, port }]`: the local interface addresses with the bound port, to tell peers. |
+| `maxGsoSegments`, `groSegments` | How many datagrams the app sends and receives per syscall (1 means no GSO/GRO). |
+| `closed`, `bufferedAmount` | Whether the socket is closed, and the bytes not yet handed to the network (for backpressure). |
+
+GSO: with `segmentSize`, `data` holds several datagrams of that size, and
+the last may be shorter. The app sends them with as few syscalls as the OS
+allows. Received GRO batches are split into single datagrams, unless the
+socket was opened with `gro: true`. Then `onmessage` may get several
+datagrams from one source at once, with `segmentSize` set.
+
+`bind` and `connect` reject with a `DOMException`:
+
+- `NotAllowedError` when the user or app denies access.
+- `InvalidAccessError` when the app refuses the address, for example a
+  privileged port or a local address not on this machine.
+- `NetworkError` when the address is in use, a name does not resolve, a
+  limit is exceeded, or the app cannot be reached.
+- `NotSupportedError` when there is no bridge to an app.
+
+They reject with a `TypeError` for malformed options.
+
+### Direct Sockets `UDPSocket` (compatibility layer)
+
+The script also installs `window.UDPSocket`, following the
+[Direct Sockets spec](https://wicg.github.io/direct-sockets/), when the
+browser has no native one. It is built on the socket above, with Streams.
+Code written for Chrome's Isolated Web Apps runs unchanged. Code written
+against it runs on Chrome's native implementation, as long as it skips the
+extensions below.
+
+It costs throughput. Streams add several promises and a copy per datagram,
+so it reaches about half the packet rate of `webviewSockets.udp` (see
+[Performance](#performance)). Use `webviewSockets.udp` where speed matters.
 
 | Spec | Supported |
 | --- | --- |
@@ -112,8 +171,7 @@ Errors use the spec's names:
 - `NotAllowedError` when the user or app denies access, when access is
   revoked or switched off while a socket is open, and for multicast,
   broadcast, unspecified or port 0 destinations.
-- `InvalidAccessError` when the app refuses the address. For example, a
-  privileged port, or a local address that is not on this machine.
+- `InvalidAccessError` when the app refuses the address.
 - `NetworkError` when binding fails, a name does not resolve, a host limit
   is exceeded, or the connection to the app drops.
 - `InvalidStateError` from `close()`, when the socket is not open yet or a
@@ -123,38 +181,36 @@ As with a native `UDPSocket`, a rejected write errors the `writable`. The
 `readable` queues up to 4096 datagrams. When the page reads more slowly,
 further datagrams are dropped, as a full socket buffer would.
 
-### Extensions
+These extensions are not part of Direct Sockets:
 
-These are not part of Direct Sockets. Leave them out for code that must
-also run on Chrome's native implementation.
-
-- `segmentSize` on a written message: GSO. `data` holds several datagrams
-  of that size, and the last may be shorter. The app sends them with one
-  syscall where the OS supports it.
-- Constructor option `gro: true`: a read message may hold several datagrams
-  from the same source, all `segmentSize` bytes except the last (GRO). If
-  the option is not set, every read message is one datagram.
-- `ecn` (0 to 3) on written and read messages. It is set on a read message
-  only when it is not 0.
-- `opened` also has `interfaceAddresses` (`[{ address, port }]`, the local
-  interface addresses with the bound port), `maxGsoSegments` and
+- `segmentSize` (GSO) and `ecn` on written messages. Read messages carry
+  `ecn` when it is not 0.
+- Constructor option `gro: true`: a read message may hold several
+  datagrams, with `segmentSize` set.
+- `opened` also has `interfaceAddresses`, `maxGsoSegments` and
   `groSegments`.
-- `socket.onsenderror = (err) => ...`. Writes resolve when the datagram is
-  handed to the app. If sending fails after that (for example, a host name
-  that does not resolve), the handler gets a `DOMException`, and the socket
-  stays open. If no handler is set, the error is logged.
+- `socket.onsenderror = (err) => ...`: a `DOMException` for a send that
+  failed in the app after its write resolved. The socket stays open.
 
-### `window.webviewSockets`
+`webviewSockets.UDPSocket` is always the compatibility class, even when
+`window.UDPSocket` is native.
 
-This is a small control object, also present when the browser has a native
-`UDPSocket`:
+### Performance
 
-- `version`: the wire protocol version (2).
-- `UDPSocket`: the polyfill class, even when `window.UDPSocket` is native.
-- `requestSession()` -> `Promise<{ url, token }>`: asks the app for a
-  session, which may prompt the user. `new UDPSocket()` calls it as needed,
-  so pages rarely need it. It is for code that speaks the wire protocol
-  directly, such as the Rust crate, or to hand a session to a Worker.
+These numbers come from the demo page's benchmark, run in headless Chrome
+against `udp-echo` on loopback. It sends 1200-byte datagrams, using a
+release test-host on a loaded 22-core machine, so the spread is wide:
+
+| | RTT p50 | Throughput, window 64 |
+| --- | --- | --- |
+| `webviewSockets.udp` | 0.4-0.6 ms | 17-29k pkt/s each way (160-280 Mbit/s) |
+| `UDPSocket` layer | 0.3-0.8 ms | 7-14k pkt/s each way (70-140 Mbit/s) |
+
+A page-only benchmark replaces the app with an in-page echo, so it
+measures just the script's CPU cost. It gets 53-75k pkt/s with
+`webviewSockets.udp` and 6-13k pkt/s with `UDPSocket`. Earlier runs of the
+same benchmark on an idle machine reached 55-63k pkt/s for the fast API
+(and 75-84k pkt/s for the Rust crate with GSO).
 
 ## Security model
 
@@ -334,10 +390,10 @@ Messages are at most 256 KiB. The host closes with 4001 (revoked), 4002
 
 | Path | What |
 | --- | --- |
-| [`demos/js`](demos/js) | Plain JS with `new UDPSocket(...)`: bound socket with echo mode, a connected socket by host name, automation and a benchmark |
+| [`demos/js`](demos/js) | Plain JS on `webviewSockets.udp`: bound socket with echo mode, a connected socket by host name, automation and a benchmark; `?api=udpsocket` runs it all on `UDPSocket` |
 | [`demos/wasm`](demos/wasm) | The same in Rust on the `webview-sockets` crate |
 | `udp-echo` | Native echo server and client: `cargo run -p webview-sockets-demo --bin udp-echo -- listen` |
-| [`host/examples/test-page`](host/examples/test-page) | Self test of the `UDPSocket` API in a browser |
+| [`host/examples/test-page`](host/examples/test-page) | Self test of `webviewSockets.udp` and `UDPSocket` in a browser |
 
 ```sh
 cargo test --workspace
@@ -367,10 +423,12 @@ Not supported:
 - TCP (`TCPSocket`, `TCPServerSocket`).
 - Multicast.
 - Sockets in Workers. A Worker can use a session from `requestSession()`
-  through the Rust crate's `init_with_session`, but `UDPSocket` itself is
+  through the Rust crate's `init_with_session`, but `webviewSockets` itself is
   only defined in the top window.
-- Per-write delivery errors. A write resolves when the app has the
-  datagram, and later failures go to `onsenderror`.
+- Per-send delivery errors. Sends report failures asynchronously
+  (`onerror`, or `onsenderror` on `UDPSocket`, where the write has
+  already resolved).
+- `UDPSocket` is about half as fast as `webviewSockets.udp`.
 
 ## License
 

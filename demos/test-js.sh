@@ -35,7 +35,12 @@ check FAIL "peer=0.0.0.0:$echo_port&send=x"
 check PASS "connect=localhost:$echo_port&send=named&expect=named&dnsQueryType=ipv4"
 check PASS "connect=[::1]:$echo_port&send=c6&expect=c6"
 check FAIL "connect=no-such-host.invalid:$echo_port&send=x"
+# The same page on the Direct Sockets UDPSocket layer.
+check PASS "api=udpsocket&peer=127.0.0.1:$echo_port&send=hello&expect=hello"
+check PASS "api=udpsocket&connect=localhost:$echo_port&send=named&expect=named&dnsQueryType=ipv4"
+check FAIL "api=udpsocket&connect=no-such-host.invalid:$echo_port&send=x"
 if [ "${1:-}" = "--bench" ]; then
   check PASS "bench=127.0.0.1:$echo_port" 120000
+  check PASS "api=udpsocket&bench=127.0.0.1:$echo_port" 120000
 fi
 exit $fail

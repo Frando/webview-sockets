@@ -1,5 +1,5 @@
 // Tests of the injected script that need no host: install rules, host
-// patterns and UDPSocket option and constructor checks.
+// patterns and the UDPSocket option and constructor checks.
 //
 //   node host/js/polyfill.test.mjs
 //
@@ -60,7 +60,8 @@ function throwsName(f, name) {
   check("webviewSockets.UDPSocket is the polyfill", w.webviewSockets.UDPSocket === w.UDPSocket);
   check("version", w.webviewSockets.version === 2);
   check("requestSession", typeof w.webviewSockets.requestSession === "function");
-  check("no old udp API", w.webviewSockets.udp === undefined);
+  check("udp.bind", typeof w.webviewSockets.udp.bind === "function");
+  check("udp.connect", typeof w.webviewSockets.udp.connect === "function");
 }
 {
   const w = page({ native: true });
