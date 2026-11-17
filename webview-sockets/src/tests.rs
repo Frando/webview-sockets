@@ -122,7 +122,7 @@ fn connect_host_by_name() {
         assert!(s.peer_addr().expect("peer").is_ipv6());
     }
     let err = UdpSocket::connect_host("localhost", port, Some(super::DnsQueryType::Ipv6))
-        .and_then(|s| s.peer_addr());
+        .and_then(|sock| sock.peer_addr());
     // localhost may or may not resolve to ::1.
     if let Ok(peer) = err {
         assert!(peer.is_ipv6());

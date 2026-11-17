@@ -119,9 +119,9 @@ function wsSend(conn, bytes) {
 
 function wsClose(conn, code) {
   if (conn.closed) return;
-  const p = Buffer.alloc(2);
-  p.writeUInt16BE(code, 0);
-  sendFrame(conn.socket, 8, p);
+  const payload = Buffer.alloc(2);
+  payload.writeUInt16BE(code, 0);
+  sendFrame(conn.socket, 8, payload);
   conn.socket.end();
   conn.closed = true;
   conn.onclose();
@@ -198,12 +198,12 @@ function session(conn) {
   };
 
   // Coalesces consecutive same-peer, same-size datagrams (up to 4) into one
-  // GRO record; the last of a batch may be shorter.
+  // GRO record. The last datagram of a batch may be shorter.
   function flushRecv() {
     const records = [];
-    let cur = null;
-    for (const d of pending) {
-      const closeCode = CLOSE_PAYLOADS[new TextDecoder().decode(d.data)];
+    let batch = null;
+    for (const datagram of pending) {
+      const closeCode = CLOSE_PAYLOADS[new TextDecoder().decode(datagram.data)];
       if (closeCode !== undefined) {
         if (records.length) wsSend(conn, codec.encodeData(records));
         wsClose(conn, closeCode);
@@ -211,29 +211,29 @@ function session(conn) {
         return;
       }
       const fits =
-        cur &&
-        cur.address === d.address &&
-        cur.port === d.port &&
-        cur.parts.length < 4 &&
-        cur.lastLen === cur.size &&
-        d.data.length <= cur.size;
+        batch &&
+        batch.address === datagram.address &&
+        batch.port === datagram.port &&
+        batch.parts.length < 4 &&
+        batch.lastLen === batch.size &&
+        datagram.data.length <= batch.size;
       if (fits) {
-        cur.parts.push(d.data);
-        cur.lastLen = d.data.length;
+        batch.parts.push(datagram.data);
+        batch.lastLen = datagram.data.length;
       } else {
-        cur = { address: d.address, port: d.port, size: d.data.length, lastLen: d.data.length, parts: [d.data] };
-        records.push(cur);
+        batch = { address: datagram.address, port: datagram.port, size: datagram.data.length, lastLen: datagram.data.length, parts: [datagram.data] };
+        records.push(batch);
       }
     }
     pending = [];
     wsSend(
       conn,
       codec.encodeData(
-        records.map((r) => ({
-          address: r.address,
-          port: r.port,
-          segmentSize: r.parts.length > 1 ? r.size : 0,
-          payload: Buffer.concat(r.parts),
+        records.map((record) => ({
+          address: record.address,
+          port: record.port,
+          segmentSize: record.parts.length > 1 ? record.size : 0,
+          payload: Buffer.concat(record.parts),
         })),
       ),
     );
@@ -244,7 +244,7 @@ function session(conn) {
 
 const echo = dgram.createSocket("udp4");
 echo.on("message", (data, rinfo) => echo.send(data, rinfo.port, rinfo.address));
-await new Promise((r) => echo.bind(0, "127.0.0.1", r));
+await new Promise((resolve) => echo.bind(0, "127.0.0.1", resolve));
 const echoAddr = `127.0.0.1:${echo.address().port}`;
 
 const server = createServer((_req, res) => res.writeHead(404).end());
@@ -255,7 +255,7 @@ server.on("upgrade", (req, socket) => {
   }
   session(wsAccept(req, socket));
 });
-await new Promise((r) => server.listen(0, "127.0.0.1", r));
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const url = `http://127.0.0.1:${server.address().port}${codec.WS_PATH}`;
 
 // Payloads that make the mock host close the WebSocket with a given code.
@@ -298,7 +298,7 @@ try {
 }
 {
   const echoPort = echo.address().port;
-  const got = await shim.connect_host("localhost", echoPort).catch((e) => `error ${e}`);
+  const got = await shim.connect_host("localhost", echoPort).catch((err) => `error ${err}`);
   check("connect_host by name", got, `ok 127.0.0.1:${echoPort}`);
   check("connect_host unresolvable", await shim.connect_host("nx.invalid", echoPort), "NotFound");
 }

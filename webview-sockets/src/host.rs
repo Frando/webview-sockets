@@ -1,6 +1,6 @@
-//! Host backend: UDP sockets owned by the host app, reached over one
-//! WebSocket per socket.
+//! Host backend: UDP sockets owned by the host app.
 //!
+//! Each socket is reached over its own WebSocket to the host app.
 //! JavaScript objects live in a `thread_local!` registry keyed by socket id.
 //! Rust handles only hold an `Arc<Shared>` with a mutex and wakers, which
 //! makes them `Send + Sync` without unsafe code. wasm32-unknown-unknown
@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{BinaryType, CloseEvent, MessageEvent, WebSocket};
 use webview_sockets_proto as proto;
+
+use crate::DnsQueryType;
 
 /// Above this many queued bytes sends return `WouldBlock`.
 const HIGH_WATER: usize = 256 * 1024;
@@ -39,10 +41,10 @@ const MAX_RECORD_HEADER: usize = 1 + 1 + 19 + 2 + 4;
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = queueMicrotask)]
-    fn queue_microtask(cb: &Function);
+    fn queue_microtask(callback: &Function);
 
     #[wasm_bindgen(js_name = setTimeout)]
-    fn set_timeout(cb: &Function, ms: i32) -> JsValue;
+    fn set_timeout(callback: &Function, ms: i32) -> JsValue;
 }
 
 /// Session from `webviewSockets.requestSession()`.
@@ -52,28 +54,33 @@ struct Session {
     token: [u8; proto::TOKEN_LEN],
 }
 
+/// The session set by [`init`] or [`init_with_session`].
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+/// The id of the next socket, the key in [`REGISTRY`].
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static REGISTRY: RefCell<HashMap<u64, Js>> = RefCell::new(HashMap::new());
+    /// The JavaScript side of each open socket, by socket id.
+    static REGISTRY: RefCell<HashMap<u64, JsSocket>> = RefCell::new(HashMap::new());
 }
 
 /// The JavaScript side of one socket.
-struct Js {
+struct JsSocket {
     ws: WebSocket,
     _on_open: Closure<dyn FnMut(JsValue)>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_close: Closure<dyn FnMut(CloseEvent)>,
 }
 
-fn ws_of(id: u64) -> Option<WebSocket> {
+/// Returns the WebSocket of socket `id`, or `None` if it was dropped.
+fn websocket(id: u64) -> Option<WebSocket> {
     REGISTRY
-        .try_with(|r| r.borrow().get(&id).map(|js| js.ws.clone()))
+        .try_with(|registry| registry.borrow().get(&id).map(|js| js.ws.clone()))
         .ok()
         .flatten()
 }
 
+/// Requests a session from `window.webviewSockets` and stores it.
 pub(crate) async fn init() -> io::Result<()> {
     let api = host_api().ok_or_else(|| {
         io::Error::new(
@@ -83,7 +90,7 @@ pub(crate) async fn init() -> io::Result<()> {
     })?;
     let request = Reflect::get(&api, &"requestSession".into())
         .ok()
-        .and_then(|f| f.dyn_into::<Function>().ok())
+        .and_then(|value| value.dyn_into::<Function>().ok())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -102,6 +109,7 @@ pub(crate) async fn init() -> io::Result<()> {
     init_with_session(&url, &token)
 }
 
+/// Stores a session for the sockets opened from now on.
 pub(crate) fn init_with_session(url: &str, token: &str) -> io::Result<()> {
     let token = parse_token(token)?;
     let url = resolve_ws_url(url)?;
@@ -110,6 +118,7 @@ pub(crate) fn init_with_session(url: &str, token: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Returns whether a session is set or the host API is present.
 pub(crate) fn is_available() -> bool {
     SESSION.lock().expect("poisoned").is_some() || host_api().is_some()
 }
@@ -120,14 +129,15 @@ fn host_api() -> Option<JsValue> {
     api.is_object().then_some(api)
 }
 
-fn get_string(obj: &JsValue, key: &str) -> Option<String> {
-    Reflect::get(obj, &key.into()).ok()?.as_string()
+/// Returns the string property `key` of `object`.
+fn get_string(object: &JsValue, key: &str) -> Option<String> {
+    Reflect::get(object, &key.into()).ok()?.as_string()
 }
 
 /// Maps a rejected promise or thrown JS value to an io error.
 fn js_error(err: JsValue) -> io::Error {
     let name = get_string(&err, "name").unwrap_or_default();
-    let msg = get_string(&err, "message")
+    let message = get_string(&err, "message")
         .or_else(|| err.as_string())
         .unwrap_or_else(|| format!("{err:?}"));
     let kind = match name.as_str() {
@@ -135,36 +145,38 @@ fn js_error(err: JsValue) -> io::Error {
         "SyntaxError" | "TypeError" => io::ErrorKind::InvalidInput,
         _ => io::ErrorKind::Other,
     };
-    io::Error::new(kind, format!("{name}: {msg}"))
+    io::Error::new(kind, format!("{name}: {message}"))
 }
 
+/// Parses a session token from 64 hex chars.
 fn parse_token(token: &str) -> io::Result<[u8; proto::TOKEN_LEN]> {
-    let bad = || io::Error::new(io::ErrorKind::InvalidInput, "token must be 64 hex chars");
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "token must be 64 hex chars");
     let bytes = token.as_bytes();
     if bytes.len() != proto::TOKEN_LEN * 2 {
-        return Err(bad());
+        return Err(invalid());
     }
     let mut out = [0u8; proto::TOKEN_LEN];
-    for (o, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
-        let hi = (pair[0] as char).to_digit(16).ok_or_else(bad)?;
-        let lo = (pair[1] as char).to_digit(16).ok_or_else(bad)?;
-        *o = (hi * 16 + lo) as u8;
+    for (byte, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        let high = (pair[0] as char).to_digit(16).ok_or_else(invalid)?;
+        let low = (pair[1] as char).to_digit(16).ok_or_else(invalid)?;
+        *byte = (high * 16 + low) as u8;
     }
     Ok(out)
 }
 
-/// Resolves `url` against the current location and switches http(s) to
-/// ws(s).
+/// Resolves `url` against the current location.
+///
+/// An `http` or `https` URL becomes a `ws` or `wss` URL.
 fn resolve_ws_url(url: &str) -> io::Result<String> {
-    let invalid = |e: JsValue| {
+    let invalid = |err: JsValue| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("bad session url {url:?}: {e:?}"),
+            format!("bad session url {url:?}: {err:?}"),
         )
     };
     let base = Reflect::get(&js_sys::global(), &"location".into())
         .ok()
-        .and_then(|loc| get_string(&loc, "href"));
+        .and_then(|location| get_string(&location, "href"));
     let parsed = match base {
         Some(base) => web_sys::Url::new_with_base(url, &base),
         None => web_sys::Url::new(url),
@@ -184,7 +196,8 @@ fn resolve_ws_url(url: &str) -> io::Result<String> {
     Ok(parsed.href())
 }
 
-fn proto_error(code: proto::ErrorCode, msg: &str) -> (io::ErrorKind, String) {
+/// Maps an ERROR frame to an error kind and message.
+fn proto_error(code: proto::ErrorCode, message: &str) -> (io::ErrorKind, String) {
     let kind = match code {
         proto::ErrorCode::NotAllowed => io::ErrorKind::PermissionDenied,
         proto::ErrorCode::InvalidInput => io::ErrorKind::InvalidInput,
@@ -192,13 +205,13 @@ fn proto_error(code: proto::ErrorCode, msg: &str) -> (io::ErrorKind, String) {
         proto::ErrorCode::NameNotResolved => io::ErrorKind::NotFound,
         proto::ErrorCode::Limit | proto::ErrorCode::Io => io::ErrorKind::Other,
     };
-    (kind, format!("host error {}: {msg}", code.name()))
+    (kind, format!("host error {}: {message}", code.name()))
 }
 
 /// Maps a WebSocket close code to the error kind reported to the caller.
 ///
 /// The host closes with [`proto::close_code::REVOKED`] or
-/// [`proto::close_code::SETTING_OFF`] when the user withdrew access; those
+/// [`proto::close_code::SETTING_OFF`] when the user withdrew access. Those
 /// map to [`io::ErrorKind::PermissionDenied`] so callers stop retrying. Every
 /// other close is [`io::ErrorKind::ConnectionAborted`].
 fn close_kind(code: u16) -> io::ErrorKind {
@@ -210,6 +223,7 @@ fn close_kind(code: u16) -> io::ErrorKind {
     }
 }
 
+/// Returns a short description of a WebSocket close code.
 fn close_reason(code: u16) -> &'static str {
     match code {
         proto::close_code::NORMAL => "closed",
@@ -222,18 +236,20 @@ fn close_reason(code: u16) -> &'static str {
     }
 }
 
-/// Handle to a socket; clones share the socket.
+/// Handle to a socket. Clones share the socket.
 #[derive(Debug, Clone)]
 pub(crate) struct Socket {
     shared: Arc<Shared>,
 }
 
+/// The part of a socket that all handles share.
 #[derive(Debug)]
 struct Shared {
     id: u64,
     state: Mutex<State>,
 }
 
+/// How far the socket got in its life.
 #[derive(Debug)]
 enum Phase {
     /// Waiting for the WebSocket to open and BOUND to arrive.
@@ -256,6 +272,7 @@ struct Datagram {
 }
 
 impl Datagram {
+    /// Returns the number of bytes not yet consumed.
     fn remaining(&self) -> usize {
         self.data.len() - self.offset
     }
@@ -264,33 +281,53 @@ impl Datagram {
     fn next_len(&self) -> usize {
         match self.stride {
             0 => self.remaining(),
-            s => s.min(self.remaining()),
+            stride => stride.min(self.remaining()),
         }
     }
 }
 
+/// How the socket was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// Bound to a local address, see [`Socket::bind`].
+    Bound,
+    /// Connected to a host name, see [`Socket::connect_host`].
+    ///
+    /// Sends wait for BOUND, which sets the peer.
+    Connected,
+}
+
+/// The mutable state of a socket.
 #[derive(Debug)]
 struct State {
     phase: Phase,
+    mode: OpenMode,
+    /// The address passed to bind, reported until BOUND arrives.
     requested: SocketAddr,
+    /// The local address reported in BOUND.
     local: Option<SocketAddr>,
     interface_addrs: Vec<SocketAddr>,
     max_gso_segments: usize,
     gro_segments: usize,
+    /// The connected peer, set by `connect` or by BOUND in connected mode.
     peer: Option<SocketAddr>,
-    /// Opened in connected mode: sends wait for BOUND, which sets `peer`.
-    connected_mode: bool,
+    /// The encoded HELLO, sent when the WebSocket opens.
     hello: Vec<u8>,
+    /// Received datagrams not yet read.
     recv: VecDeque<Datagram>,
+    /// Bytes not yet read in `recv`.
     recv_bytes: usize,
     /// Encoded messages not yet handed to the WebSocket.
     out: Vec<Vec<u8>>,
+    /// Bytes in `out`.
     out_bytes: usize,
     /// Last seen `WebSocket.bufferedAmount`.
     buffered: usize,
+    /// Sends return `WouldBlock` while the backlog is too large.
     paused: bool,
     flush_scheduled: bool,
     recheck_scheduled: bool,
+    /// The last error the host reported for a send, for `take_error`.
     pending_error: Option<(io::ErrorKind, String)>,
     recv_wakers: Vec<Waker>,
     send_wakers: Vec<Waker>,
@@ -298,9 +335,10 @@ struct State {
 }
 
 impl State {
+    /// Returns the error of a failed socket, or `None` if it did not fail.
     fn failed(&self) -> Option<io::Error> {
         match &self.phase {
-            Phase::Failed(kind, msg) => Some(io::Error::new(*kind, msg.clone())),
+            Phase::Failed(kind, message) => Some(io::Error::new(*kind, message.clone())),
             _ => None,
         }
     }
@@ -315,16 +353,17 @@ impl State {
         }
     }
 
+    /// Appends a DATA record to the last outgoing message, or to a new one.
     fn enqueue(&mut self, data: proto::Data<'_>) {
         let len = data.encoded_len();
         match self.out.last_mut() {
-            Some(msg) if msg.len() + len <= proto::MAX_MESSAGE_LEN => {
-                proto::encode_data(&data, msg)
+            Some(message) if message.len() + len <= proto::MAX_MESSAGE_LEN => {
+                proto::encode_data(&data, message)
             }
             _ => {
-                let mut msg = Vec::with_capacity(len);
-                proto::encode_data(&data, &mut msg);
-                self.out.push(msg);
+                let mut message = Vec::with_capacity(len);
+                proto::encode_data(&data, &mut message);
+                self.out.push(message);
             }
         }
         self.out_bytes += len;
@@ -333,9 +372,13 @@ impl State {
     /// Drops queued datagrams not from the connected peer.
     fn skip_foreign(&mut self) {
         if let Some(peer) = self.peer {
-            while self.recv.front().is_some_and(|d| d.from != peer) {
-                let d = self.recv.pop_front().expect("checked");
-                self.recv_bytes -= d.remaining();
+            while self
+                .recv
+                .front()
+                .is_some_and(|datagram| datagram.from != peer)
+            {
+                let datagram = self.recv.pop_front().expect("checked");
+                self.recv_bytes -= datagram.remaining();
             }
         }
     }
@@ -350,40 +393,44 @@ impl State {
         }
     }
 
-    fn fail(&mut self, kind: io::ErrorKind, msg: String) -> Vec<Waker> {
+    /// Marks the socket as failed and returns the wakers to wake.
+    fn fail(&mut self, kind: io::ErrorKind, message: String) -> Vec<Waker> {
         if matches!(self.phase, Phase::Failed(..)) {
             return Vec::new();
         }
-        self.phase = Phase::Failed(kind, msg);
+        self.phase = Phase::Failed(kind, message);
         self.out.clear();
         self.out_bytes = 0;
         self.take_all_wakers()
     }
 
+    /// Takes the wakers of all waiting tasks.
     fn take_all_wakers(&mut self) -> Vec<Waker> {
-        let mut w = std::mem::take(&mut self.recv_wakers);
-        w.append(&mut self.send_wakers);
-        w.append(&mut self.bound_wakers);
-        w
+        let mut wakers = std::mem::take(&mut self.recv_wakers);
+        wakers.append(&mut self.send_wakers);
+        wakers.append(&mut self.bound_wakers);
+        wakers
     }
 }
 
+/// Adds the waker of `cx` to `wakers` unless an equivalent one is there.
 fn add_waker(wakers: &mut Vec<Waker>, cx: &Context<'_>) {
-    if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+    if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
         wakers.push(cx.waker().clone());
     }
 }
 
+/// Wakes all `wakers`.
 fn wake(wakers: Vec<Waker>) {
-    for w in wakers {
-        w.wake();
+    for waker in wakers {
+        waker.wake();
     }
 }
 
 impl Drop for Shared {
     fn drop(&mut self) {
         let js = REGISTRY
-            .try_with(|r| r.borrow_mut().remove(&self.id))
+            .try_with(|registry| registry.borrow_mut().remove(&self.id))
             .ok()
             .flatten();
         let Some(js) = js else { return };
@@ -393,8 +440,8 @@ impl Drop for Shared {
         // Like std, datagrams passed to send are not lost on drop.
         let state = self.state.get_mut().expect("poisoned");
         if matches!(state.phase, Phase::Bound) {
-            for msg in state.out.drain(..) {
-                js.ws.send_with_u8_array(&msg).ok();
+            for message in state.out.drain(..) {
+                js.ws.send_with_u8_array(&message).ok();
             }
         }
         js.ws.close_with_code(proto::close_code::NORMAL).ok();
@@ -403,13 +450,14 @@ impl Drop for Shared {
 }
 
 impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("poisoned")
     }
 
+    /// Sends HELLO when the WebSocket opens.
     fn on_open(&self) {
         let hello = std::mem::take(&mut self.lock().hello);
-        if let Some(ws) = ws_of(self.id)
+        if let Some(ws) = websocket(self.id)
             && let Err(err) = ws.send_with_u8_array(&hello)
         {
             let err = js_error(err);
@@ -418,28 +466,30 @@ impl Shared {
         }
     }
 
-    fn on_message(self: &Arc<Self>, ev: MessageEvent) {
-        let Ok(buf) = ev.data().dyn_into::<ArrayBuffer>() else {
+    /// Handles a message from the host.
+    fn on_message(self: &Arc<Self>, event: MessageEvent) {
+        let Ok(buf) = event.data().dyn_into::<ArrayBuffer>() else {
             warn!(id = self.id, "ignoring non-binary message");
             return;
         };
-        let msg = Uint8Array::new(&buf).to_vec();
+        let message = Uint8Array::new(&buf).to_vec();
         let mut state = self.lock();
         let wakers = match state.phase {
-            Phase::Connecting => self.on_first(&mut state, &msg),
-            Phase::Bound => on_data(&mut state, &msg),
+            Phase::Connecting => self.on_first(&mut state, &message),
+            Phase::Bound => on_data(&mut state, &message),
             Phase::Failed(..) => Vec::new(),
         };
         let close = matches!(state.phase, Phase::Failed(..));
         drop(state);
-        if close && let Some(ws) = ws_of(self.id) {
+        if close && let Some(ws) = websocket(self.id) {
             ws.close().ok();
         }
         wake(wakers);
     }
 
-    fn on_first(self: &Arc<Self>, state: &mut State, msg: &[u8]) -> Vec<Waker> {
-        match proto::decode_first(msg) {
+    /// Handles the first message, BOUND or ERROR.
+    fn on_first(self: &Arc<Self>, state: &mut State, message: &[u8]) -> Vec<Waker> {
+        match proto::decode_first(message) {
             Ok(proto::Frame::Bound(bound)) => {
                 debug!(id = self.id, local = %bound.local, "udp socket bound");
                 state.phase = Phase::Bound;
@@ -456,9 +506,9 @@ impl Shared {
                 state.take_all_wakers()
             }
             Ok(proto::Frame::Error(err)) => {
-                let (kind, msg) = proto_error(err.code, err.message);
-                debug!(id = self.id, %msg, "udp bind refused");
-                state.fail(kind, msg)
+                let (kind, message) = proto_error(err.code, err.message);
+                debug!(id = self.id, %message, "udp bind refused");
+                state.fail(kind, message)
             }
             Ok(proto::Frame::Hello(_)) => {
                 state.fail(io::ErrorKind::InvalidData, "host sent HELLO".to_string())
@@ -470,24 +520,25 @@ impl Shared {
         }
     }
 
-    fn on_close(&self, ev: CloseEvent) {
-        let code = ev.code();
-        let reason = ev.reason();
+    /// Fails the socket when the WebSocket closes.
+    fn on_close(&self, event: CloseEvent) {
+        let code = event.code();
+        let reason = event.reason();
         debug!(id = self.id, code, %reason, "udp websocket closed");
         let mut state = self.lock();
         let when = match state.phase {
             Phase::Connecting => " before bind",
             _ => "",
         };
-        let mut msg = format!(
+        let mut message = format!(
             "connection to host closed{when} ({code} {})",
             close_reason(code)
         );
         if !reason.is_empty() {
-            msg.push_str(": ");
-            msg.push_str(&reason);
+            message.push_str(": ");
+            message.push_str(&reason);
         }
-        let wakers = state.fail(close_kind(code), msg);
+        let wakers = state.fail(close_kind(code), message);
         drop(state);
         wake(wakers);
     }
@@ -499,14 +550,15 @@ impl Shared {
         }
         state.flush_scheduled = true;
         let weak = Arc::downgrade(self);
-        let cb = Closure::once_into_js(move || {
+        let callback = Closure::once_into_js(move || {
             if let Some(shared) = weak.upgrade() {
                 shared.flush();
             }
         });
-        queue_microtask(cb.unchecked_ref());
+        queue_microtask(callback.unchecked_ref());
     }
 
+    /// Hands queued messages to the WebSocket.
     fn flush(self: &Arc<Self>) {
         let mut state = self.lock();
         state.flush_scheduled = false;
@@ -516,9 +568,11 @@ impl Shared {
         let out = std::mem::take(&mut state.out);
         state.out_bytes = 0;
         drop(state);
-        let Some(ws) = ws_of(self.id) else { return };
-        for msg in &out {
-            if let Err(err) = ws.send_with_u8_array(msg) {
+        let Some(ws) = websocket(self.id) else {
+            return;
+        };
+        for message in &out {
+            if let Err(err) = ws.send_with_u8_array(message) {
                 let err = js_error(err);
                 let wakers = self
                     .lock()
@@ -542,16 +596,17 @@ impl Shared {
         }
         state.recheck_scheduled = true;
         let weak = Arc::downgrade(self);
-        let cb = Closure::once_into_js(move || {
+        let callback = Closure::once_into_js(move || {
             if let Some(shared) = weak.upgrade() {
                 shared.recheck();
             }
         });
-        set_timeout(cb.unchecked_ref(), RECHECK_MS);
+        set_timeout(callback.unchecked_ref(), RECHECK_MS);
     }
 
+    /// Updates the backlog and wakes waiting senders once it is small enough.
     fn recheck(self: &Arc<Self>) {
-        let ws = ws_of(self.id);
+        let ws = websocket(self.id);
         let mut state = self.lock();
         state.recheck_scheduled = false;
         if let Some(ws) = ws {
@@ -570,7 +625,7 @@ impl Shared {
     /// Refreshes the pressure state from the WebSocket.
     fn refresh_pressure(&self, state: &mut State) {
         if state.paused
-            && let Some(ws) = ws_of(self.id)
+            && let Some(ws) = websocket(self.id)
         {
             state.buffered = ws.buffered_amount() as usize;
             state.update_pressure();
@@ -578,13 +633,14 @@ impl Shared {
     }
 }
 
-fn on_data(state: &mut State, msg: &[u8]) -> Vec<Waker> {
-    if proto::message_kind(msg) == Some(proto::KIND_ERROR) {
-        match proto::decode_first(msg) {
+/// Handles a message after BOUND: received datagrams or a send error.
+fn on_data(state: &mut State, message: &[u8]) -> Vec<Waker> {
+    if proto::message_kind(message) == Some(proto::KIND_ERROR) {
+        match proto::decode_first(message) {
             Ok(proto::Frame::Error(err)) => {
-                let (kind, msg) = proto_error(err.code, err.message);
-                debug!(%msg, "udp send failed on host");
-                state.pending_error = Some((kind, msg));
+                let (kind, message) = proto_error(err.code, err.message);
+                debug!(%message, "udp send failed on host");
+                state.pending_error = Some((kind, message));
                 return Vec::new();
             }
             Ok(_) => unreachable!("kind checked"),
@@ -596,11 +652,11 @@ fn on_data(state: &mut State, msg: &[u8]) -> Vec<Waker> {
             }
         }
     }
-    let records = match proto::decode_data(msg) {
+    let records = match proto::decode_data(message) {
         Ok(records) => records,
         Err(err) => return state.fail(io::ErrorKind::InvalidData, format!("bad message: {err}")),
     };
-    let mut got = false;
+    let mut received = false;
     for record in records {
         let record = match record {
             Ok(record) => record,
@@ -608,7 +664,7 @@ fn on_data(state: &mut State, msg: &[u8]) -> Vec<Waker> {
                 return state.fail(io::ErrorKind::InvalidData, format!("bad record: {err}"));
             }
         };
-        if state.peer.is_some_and(|p| p != record.peer) {
+        if state.peer.is_some_and(|peer| peer != record.peer) {
             continue;
         }
         if state.recv_bytes + record.payload.len() > RECV_QUEUE_BYTES {
@@ -625,42 +681,48 @@ fn on_data(state: &mut State, msg: &[u8]) -> Vec<Waker> {
             stride: record.segment_size as usize,
             offset: 0,
         });
-        got = true;
+        received = true;
     }
-    if got {
+    if received {
         std::mem::take(&mut state.recv_wakers)
     } else {
         Vec::new()
     }
 }
 
+/// Returns the error for a send or receive without a peer.
 fn not_connected() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "socket is not connected")
 }
 
+/// Returns a `WouldBlock` error.
 fn would_block() -> io::Error {
     io::Error::from(io::ErrorKind::WouldBlock)
 }
 
 impl Socket {
+    /// Opens a socket bound to `addr` on the host.
     pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Self::open(addr, |token| proto::Hello::bind(token, addr))
+        Self::open(addr, OpenMode::Bound, |token| {
+            proto::Hello::bind(token, addr)
+        })
     }
 
+    /// Opens a socket on the host connected to `host:port`.
     pub(crate) fn connect_host(
         host: &str,
         port: u16,
-        dns: Option<crate::DnsQueryType>,
+        dns: Option<DnsQueryType>,
     ) -> io::Result<Self> {
-        let dns_query_type = dns.map(|d| match d {
-            crate::DnsQueryType::Ipv4 => proto::DnsQueryType::Ipv4,
-            crate::DnsQueryType::Ipv6 => proto::DnsQueryType::Ipv6,
+        let dns_query_type = dns.map(|dns| match dns {
+            DnsQueryType::Ipv4 => proto::DnsQueryType::Ipv4,
+            DnsQueryType::Ipv6 => proto::DnsQueryType::Ipv6,
         });
         let any = match dns {
-            Some(crate::DnsQueryType::Ipv6) => SocketAddr::from(([0u16; 8], 0)),
+            Some(DnsQueryType::Ipv6) => SocketAddr::from(([0u16; 8], 0)),
             _ => SocketAddr::from(([0, 0, 0, 0], 0)),
         };
-        let sock = Self::open(any, |token| proto::Hello {
+        Self::open(any, OpenMode::Connected, |token| proto::Hello {
             token,
             mode: proto::Mode::Connected {
                 remote_host: host,
@@ -669,9 +731,7 @@ impl Socket {
             },
             send_buffer_size: 0,
             receive_buffer_size: 0,
-        })?;
-        sock.lock().connected_mode = true;
-        Ok(sock)
+        })
     }
 
     /// Opens the WebSocket and queues the HELLO built by `hello`.
@@ -679,9 +739,9 @@ impl Socket {
     /// `requested` is the local address reported until BOUND arrives.
     fn open<'a>(
         requested: SocketAddr,
+        mode: OpenMode,
         hello: impl FnOnce([u8; proto::TOKEN_LEN]) -> proto::Hello<'a>,
     ) -> io::Result<Self> {
-        let addr = requested;
         let session = SESSION.lock().expect("poisoned").clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -691,22 +751,21 @@ impl Socket {
         let ws = WebSocket::new(&session.url).map_err(js_error)?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        let mut hello_msg = Vec::new();
-        proto::encode_hello(&hello(session.token), &mut hello_msg);
-        let hello = hello_msg;
+        let mut hello_message = Vec::new();
+        proto::encode_hello(&hello(session.token), &mut hello_message);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             id,
             state: Mutex::new(State {
                 phase: Phase::Connecting,
-                requested: addr,
+                mode,
+                requested,
                 local: None,
                 interface_addrs: Vec::new(),
                 max_gso_segments: 1,
                 gro_segments: 1,
                 peer: None,
-                connected_mode: false,
-                hello,
+                hello: hello_message,
                 recv: VecDeque::new(),
                 recv_bytes: 0,
                 out: Vec::new(),
@@ -724,29 +783,29 @@ impl Socket {
 
         let weak = Arc::downgrade(&shared);
         let on_open = Closure::<dyn FnMut(JsValue)>::new(move |_| {
-            if let Some(s) = Weak::upgrade(&weak) {
-                s.on_open();
+            if let Some(shared) = Weak::upgrade(&weak) {
+                shared.on_open();
             }
         });
         let weak = Arc::downgrade(&shared);
-        let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |ev| {
-            if let Some(s) = Weak::upgrade(&weak) {
-                s.on_message(ev);
+        let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event| {
+            if let Some(shared) = Weak::upgrade(&weak) {
+                shared.on_message(event);
             }
         });
         let weak = Arc::downgrade(&shared);
-        let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |ev| {
-            if let Some(s) = Weak::upgrade(&weak) {
-                s.on_close(ev);
+        let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event| {
+            if let Some(shared) = Weak::upgrade(&weak) {
+                shared.on_close(event);
             }
         });
         ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-        REGISTRY.with(|r| {
-            r.borrow_mut().insert(
+        REGISTRY.with(|registry| {
+            registry.borrow_mut().insert(
                 id,
-                Js {
+                JsSocket {
                     ws,
                     _on_open: on_open,
                     _on_message: on_message,
@@ -754,11 +813,11 @@ impl Socket {
                 },
             )
         });
-        debug!(id, %addr, "udp socket opening");
+        debug!(id, %requested, ?mode, "udp socket opening");
         Ok(Self { shared })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.shared.lock()
     }
 
@@ -767,7 +826,9 @@ impl Socket {
             let mut state = self.lock();
             match &state.phase {
                 Phase::Bound => Poll::Ready(Ok(())),
-                Phase::Failed(kind, msg) => Poll::Ready(Err(io::Error::new(*kind, msg.clone()))),
+                Phase::Failed(kind, message) => {
+                    Poll::Ready(Err(io::Error::new(*kind, message.clone())))
+                }
                 Phase::Connecting => {
                     add_waker(&mut state.bound_wakers, cx);
                     Poll::Pending
@@ -807,21 +868,21 @@ impl Socket {
         };
         let len = front.next_len();
         let from = front.from;
-        let n = len.min(buf.len());
-        buf[..n].copy_from_slice(&front.data[front.offset..front.offset + n]);
+        let copied = len.min(buf.len());
+        buf[..copied].copy_from_slice(&front.data[front.offset..front.offset + copied]);
         state.consume(len);
-        Ok((n, from))
+        Ok((copied, from))
     }
 
     pub(crate) fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let peer = {
             let state = self.lock();
-            match state.peer {
-                Some(peer) => peer,
-                None if state.connected_mode => {
+            match (state.peer, state.mode) {
+                (Some(peer), _) => peer,
+                (None, OpenMode::Connected) => {
                     return Err(state.failed().unwrap_or_else(would_block));
                 }
-                None => return Err(not_connected()),
+                (None, OpenMode::Bound) => return Err(not_connected()),
             }
         };
         self.send_to(buf, peer)
@@ -831,13 +892,13 @@ impl Socket {
         {
             let state = self.lock();
             if state.peer.is_none() {
-                return Err(match state.connected_mode {
-                    true => state.failed().unwrap_or_else(would_block),
-                    false => not_connected(),
+                return Err(match state.mode {
+                    OpenMode::Connected => state.failed().unwrap_or_else(would_block),
+                    OpenMode::Bound => not_connected(),
                 });
             }
         }
-        self.recv_from(buf).map(|(n, _)| n)
+        self.recv_from(buf).map(|(len, _)| len)
     }
 
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
@@ -872,7 +933,7 @@ impl Socket {
             .lock()
             .pending_error
             .take()
-            .map(|(kind, msg)| io::Error::new(kind, msg)))
+            .map(|(kind, message)| io::Error::new(kind, message)))
     }
 
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
@@ -895,7 +956,7 @@ impl Socket {
     ) -> io::Result<usize> {
         let segment_size = match segment_size {
             0 => buf.len(),
-            n => n.min(buf.len()),
+            size => size.min(buf.len()),
         };
         if segment_size > MAX_DATAGRAM {
             return Err(io::Error::new(
@@ -951,17 +1012,17 @@ impl Socket {
             return Err(state.failed().unwrap_or_else(would_block));
         };
         let from = front.from;
-        let seg = front.next_len();
+        let stride = front.next_len();
         // Whole segments that fit, at least one (truncated if needed).
-        let take = if seg == 0 || seg > buf.len() {
-            seg
+        let take = if stride == 0 || stride > buf.len() {
+            stride
         } else {
-            (buf.len() / seg * seg).min(front.remaining())
+            (buf.len() / stride * stride).min(front.remaining())
         };
-        let n = take.min(buf.len());
-        buf[..n].copy_from_slice(&front.data[front.offset..front.offset + n]);
+        let copied = take.min(buf.len());
+        buf[..copied].copy_from_slice(&front.data[front.offset..front.offset + copied]);
         state.consume(take);
-        Ok((n, from, seg.min(n)))
+        Ok((copied, from, stride.min(copied)))
     }
 
     pub(crate) fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -983,7 +1044,8 @@ impl Socket {
             return Poll::Ready(Err(err));
         }
         self.shared.refresh_pressure(&mut state);
-        let waiting_for_peer = state.connected_mode && matches!(state.phase, Phase::Connecting);
+        let waiting_for_peer =
+            state.mode == OpenMode::Connected && matches!(state.phase, Phase::Connecting);
         if !state.paused && !waiting_for_peer {
             return Poll::Ready(Ok(()));
         }
@@ -995,6 +1057,7 @@ impl Socket {
     }
 }
 
+/// Accepts only `None`, because sockets on wasm cannot block.
 fn no_timeout(dur: Option<Duration>) -> io::Result<()> {
     match dur {
         None => Ok(()),

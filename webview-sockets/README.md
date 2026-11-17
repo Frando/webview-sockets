@@ -24,7 +24,7 @@ RUSTFLAGS='--cfg webview_sockets' cargo build --target wasm32-unknown-unknown
 ```
 
 ```rust
-webview_sockets::init().await?; // requestSession(), may prompt; no-op on native
+webview_sockets::init().await?; // requestSession(), may prompt, no-op on native
 let sock = webview_sockets::UdpSocket::bind("[::]:0")?;
 sock.bound().await?; // wasm: wait until the app bound it
 sock.send_to_async(b"hello", "203.0.113.7:4433".parse()?).await?;
@@ -34,8 +34,8 @@ let (len, from) = sock.recv_from_async(&mut buf).await?;
 let peer = webview_sockets::UdpSocket::connect_host("example.org", 4433, None)?;
 ```
 
-On wasm, sockets are non-blocking (`WouldBlock`; use `poll_*_ready` or the
-`*_async` helpers), and sends before `bound()` are queued.
+On wasm, sockets are non-blocking: calls return `WouldBlock`, so use
+`poll_*_ready` or the `*_async` helpers. Sends before `bound()` are queued.
 `send_to_segmented` / `recv_from_segmented` do GSO/GRO. Errors map to
 `PermissionDenied` (denied or revoked), `ConnectionAborted`,
 `InvalidInput`, `NotFound` (name not resolved) and `Unsupported` (no

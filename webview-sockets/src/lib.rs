@@ -1,7 +1,7 @@
-//! A UDP socket shaped like [`std::net::UdpSocket`] that also works in web
-//! pages, when the app showing them in a webview provides webview-sockets.
+//! A UDP socket shaped like [`std::net::UdpSocket`] that also works in web pages.
 //!
-//! There are three backends, chosen at compile time:
+//! In a web page the socket works when the app that shows the page in a
+//! webview provides webview-sockets. There are three backends, chosen at compile time:
 //!
 //! - Native (everything except `wasm32-unknown-unknown`): a thin wrapper
 //!   around [`std::net::UdpSocket`].
@@ -67,9 +67,8 @@ mod imp;
 ///
 /// On wasm with `webview_sockets` this calls
 /// `window.webviewSockets.requestSession()`, which may show a permission
-/// prompt.
-/// It must succeed before [`UdpSocket::bind`]. Calling it again requests a new
-/// session. In a Worker, use [`init_with_session`] instead.
+/// prompt. It must succeed before [`UdpSocket::bind`]. Calling it again
+/// requests a new session. In a Worker, use [`init_with_session`] instead.
 ///
 /// On native this does nothing.
 pub async fn init() -> io::Result<()> {
@@ -78,8 +77,8 @@ pub async fn init() -> io::Result<()> {
 
 /// Uses a session obtained elsewhere, e.g. by the page for a Worker.
 ///
-/// `url` is the WebSocket URL from `requestSession()` (absolute, or relative
-/// to the current location), `token` the 64 hex char token.
+/// `url` is the WebSocket URL from `requestSession()`, absolute or relative
+/// to the current location. `token` is the token as 64 hex chars.
 ///
 /// On native this does nothing.
 pub async fn init_with_session(url: &str, token: &str) -> io::Result<()> {
@@ -94,8 +93,9 @@ pub fn is_available() -> bool {
     imp::is_available()
 }
 
-/// Which address family a host name resolves to, see
-/// [`UdpSocket::connect_host`].
+/// The address family a host name resolves to.
+///
+/// See [`UdpSocket::connect_host`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsQueryType {
     /// Only IPv4 addresses.
@@ -119,24 +119,24 @@ impl UdpSocket {
     /// On wasm only addresses that need no DNS lookup work, and the call
     /// returns before the host confirms the bind, see [`UdpSocket::bound`].
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        let mut last = None;
+        let mut last_err = None;
         for addr in addr.to_socket_addrs()? {
             match imp::Socket::bind(addr) {
                 Ok(inner) => return Ok(Self { inner }),
-                Err(err) => last = Some(err),
+                Err(err) => last_err = Some(err),
             }
         }
-        Err(last.unwrap_or_else(no_addr))
+        Err(last_err.unwrap_or_else(no_addr))
     }
 
     /// Creates a UDP socket connected to `host:port`.
     ///
     /// `host` is a host name or an IP address literal. `dns` restricts the
-    /// address family it resolves to; `None` takes the first address.
+    /// address family it resolves to. `None` takes the first address.
     ///
     /// On native this resolves the name, binds an ephemeral port of the
     /// matching family and connects. On wasm the host app resolves the name
-    /// and only exchanges datagrams with the resolved peer; the call returns
+    /// and only exchanges datagrams with the resolved peer. The call returns
     /// before that, see [`UdpSocket::bound`].
     pub fn connect_host(host: &str, port: u16, dns: Option<DnsQueryType>) -> io::Result<Self> {
         imp::Socket::connect_host(host, port, dns).map(|inner| Self { inner })
@@ -208,8 +208,8 @@ impl UdpSocket {
 
     /// Moves the socket into or out of nonblocking mode.
     ///
-    /// On wasm sockets are always nonblocking: `true` is accepted and `false`
-    /// fails with [`io::ErrorKind::Unsupported`].
+    /// On wasm, sockets are always nonblocking. `true` is accepted and
+    /// `false` fails with [`io::ErrorKind::Unsupported`].
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.inner.set_nonblocking(nonblocking)
     }
@@ -253,19 +253,19 @@ impl UdpSocket {
         })
     }
 
-    /// Returns the maximum number of segments [`UdpSocket::send_to_segmented`]
-    /// passes to the network in one go.
+    /// Returns the maximum number of segments of one GSO send.
     ///
-    /// 1 means no GSO. Native returns 1. On wasm the host reports it; it is 1
-    /// until the bind is confirmed.
+    /// [`UdpSocket::send_to_segmented`] passes at most this many segments to
+    /// the network at once. 1 means no GSO. Native returns 1. On wasm the
+    /// host reports the value, and it is 1 until the bind is confirmed.
     pub fn max_gso_segments(&self) -> usize {
         self.inner.max_gso_segments()
     }
 
-    /// Returns the maximum number of datagrams [`UdpSocket::recv_from_segmented`]
-    /// may return at once.
+    /// Returns the maximum number of datagrams of one GRO receive.
     ///
-    /// 1 means no GRO. Native returns 1.
+    /// [`UdpSocket::recv_from_segmented`] returns at most this many
+    /// datagrams at once. 1 means no GRO. Native returns 1.
     pub fn gro_segments(&self) -> usize {
         self.inner.gro_segments()
     }
@@ -295,7 +295,7 @@ impl UdpSocket {
     /// Returns the total length, the source and the stride: every datagram
     /// in `buf[..len]` is `stride` bytes long, except the last which may be
     /// shorter. A single datagram has `stride == len`. Only whole datagrams
-    /// that fit into `buf` are returned; a single datagram larger than `buf`
+    /// that fit into `buf` are returned. A single datagram larger than `buf`
     /// is truncated.
     pub fn recv_from_segmented(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, usize)> {
         self.inner.recv_from_segmented(buf)
@@ -330,7 +330,7 @@ impl UdpSocket {
             std::future::poll_fn(|cx| self.poll_recv_ready(cx)).await?;
             match self.recv_from(buf) {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                res => return res,
+                result => return result,
             }
         }
     }
@@ -341,16 +341,18 @@ impl UdpSocket {
             std::future::poll_fn(|cx| self.poll_send_ready(cx)).await?;
             match self.send_to(buf, addr) {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                res => return res,
+                result => return result,
             }
         }
     }
 }
 
+/// Returns the first address of `addr`.
 fn first_addr(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
     addr.to_socket_addrs()?.next().ok_or_else(no_addr)
 }
 
+/// Returns the error for an address list without addresses.
 fn no_addr() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "no socket address given")
 }

@@ -4,6 +4,8 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::DnsQueryType;
+
 pub(crate) async fn init() -> io::Result<()> {
     Ok(())
 }
@@ -16,6 +18,7 @@ pub(crate) fn is_available() -> bool {
     true
 }
 
+/// A socket that forwards every call to [`std::net::UdpSocket`].
 #[derive(Debug)]
 pub(crate) struct Socket(std::net::UdpSocket);
 
@@ -27,18 +30,18 @@ impl Socket {
     pub(crate) fn connect_host(
         host: &str,
         port: u16,
-        dns: Option<crate::DnsQueryType>,
+        dns: Option<DnsQueryType>,
     ) -> io::Result<Self> {
         let host = host
             .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
+            .and_then(|inner| inner.strip_suffix(']'))
             .unwrap_or(host);
         let remote = (host, port)
             .to_socket_addrs()?
-            .find(|a| match dns {
+            .find(|addr| match dns {
                 None => true,
-                Some(crate::DnsQueryType::Ipv4) => a.is_ipv4(),
-                Some(crate::DnsQueryType::Ipv6) => a.is_ipv6(),
+                Some(DnsQueryType::Ipv4) => addr.is_ipv4(),
+                Some(DnsQueryType::Ipv6) => addr.is_ipv6(),
             })
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"))
