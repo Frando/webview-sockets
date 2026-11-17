@@ -1,11 +1,12 @@
 # webview-sockets
 
-Real UDP sockets for web pages shown in a webview, provided by the app that
-embeds the webview. Pages get a small, fast API (`webviewSockets.udp`), a
+Optional UDP sockets for web pages in webviews, granted per site by the app
+that hosts the webview. Sockets are off unless the app enables them and the
+user allows the site. The app owns the real sockets. Pages get a small, fast
+API (`webviewSockets.udp`) and a
 [Direct Sockets](https://wicg.github.io/direct-sockets/) `UDPSocket`
-compatibility layer, and Rust code compiled to wasm gets a
-`std::net::UdpSocket` lookalike. The app owns the sockets and decides, per
-origin and with a user prompt, who may use them.
+compatibility layer. Rust code compiled to wasm gets a `std::net::UdpSocket`
+lookalike.
 
 ```js
 const sock = await webviewSockets.udp.bind({ localAddress: "::" }); // may prompt the user
@@ -67,9 +68,9 @@ every platform.
 
 A socket has `send(data, address?, port?, { segmentSize?, ecn? })`,
 `onmessage({ data, address, port, ecn, segmentSize? })`, `onerror`
-(a send failed; the socket stays open), `onclose({ code, reason, error? })`,
+(a send failed, the socket stays open), `onclose({ code, reason, error? })`,
 `close()`, the local and remote address, `interfaceAddrs`, and
-`bufferedAmount` for backpressure. `segmentSize` sends a GSO batch; with
+`bufferedAmount` for backpressure. `segmentSize` sends a GSO batch. With
 `gro: true`, `onmessage` may get a GRO batch.
 
 `bind` and `connect` reject with `NotAllowedError` (denied),
@@ -90,7 +91,7 @@ messages, the `gro` option, `interfaceAddresses`, and `onsenderror`.
   off closes every socket and voids every token.
 - **Per origin, with consent.** The user chooses "allow always", "allow
   once" (until the tab navigates or closes) or "block". The app can list
-  and revoke grants; revoking closes the origin's sockets.
+  and revoke grants. Revoking closes the origin's sockets.
 - **Only the app's origins.** `HostPolicy` limits which hosts may use
   sockets. With `HostPolicy::patterns` the script does not even define the
   API on other hosts. On Android, pass the same origins to
@@ -100,9 +101,10 @@ messages, the `gro` option, `interfaceAddresses`, and `onsenderror`.
 - **Tokens** are 32 random bytes, bound to the granted origin (checked
   against `Origin` and `Host`) and the tab. Local native processes can
   forge headers, so against them the secret token is the barrier.
-- **Destinations.** No multicast, broadcast, unspecified address or port 0;
-  no binding below port 1024. Loopback and private addresses are allowed,
-  so a granted page can reach the local network; the prompt should say so.
+- **Destinations.** No multicast, broadcast, unspecified address or port 0,
+  and no binding below port 1024. Loopback and private addresses are
+  allowed, so a granted page can reach the local network. The prompt should
+  say so.
 - **Limits** on sockets per tab (16) and per origin (64), message size,
   queues, buffer sizes, and handshake and DNS timeouts.
 
