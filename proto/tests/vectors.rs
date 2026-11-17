@@ -8,77 +8,77 @@ use std::{fmt::Write as _, net::SocketAddr, path::PathBuf};
 
 use webview_sockets_proto::*;
 
-fn addr(s: &str) -> SocketAddr {
-    s.parse().unwrap()
+fn addr(text: &str) -> SocketAddr {
+    text.parse().unwrap()
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|b| format!("{b:02x}")).collect()
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn json_str(s: &str) -> String {
+fn json_str(text: &str) -> String {
     let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
+    for ch in text.chars() {
+        match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
+            ch if (ch as u32) < 0x20 || (ch as u32) > 0x7e => {
                 let mut buf = [0u16; 2];
-                for u in c.encode_utf16(&mut buf) {
-                    write!(out, "\\u{u:04x}").unwrap();
+                for unit in ch.encode_utf16(&mut buf) {
+                    write!(out, "\\u{unit:04x}").unwrap();
                 }
             }
-            c => out.push(c),
+            ch => out.push(ch),
         }
     }
     out.push('"');
     out
 }
 
-fn json_dns(d: Option<DnsQueryType>) -> String {
-    d.map_or("null".to_string(), |d| format!("\"{}\"", d.name()))
+fn json_dns(dns: Option<DnsQueryType>) -> String {
+    dns.map_or("null".to_string(), |dns| format!("\"{}\"", dns.name()))
 }
 
-fn json_data(r: &Data<'_>) -> String {
+fn json_data(data: &Data<'_>) -> String {
     format!(
         "{{\"ecn\": {}, \"address\": {}, \"port\": {}, \"segmentSize\": {}, \"payload\": \"{}\"}}",
-        r.ecn,
-        json_str(&r.peer.ip().to_string()),
-        r.peer.port(),
-        r.segment_size,
-        hex(r.payload)
+        data.ecn,
+        json_str(&data.peer.ip().to_string()),
+        data.peer.port(),
+        data.segment_size,
+        hex(data.payload)
     )
 }
 
-fn json_addr(a: &SocketAddr) -> String {
+fn json_addr(addr: &SocketAddr) -> String {
     format!(
         "{{\"address\": {}, \"port\": {}}}",
-        json_str(&a.ip().to_string()),
-        a.port()
+        json_str(&addr.ip().to_string()),
+        addr.port()
     )
 }
 
 struct Vectors(Vec<String>);
 
 impl Vectors {
-    fn push(&mut self, name: &str, ty: &str, bytes: &[u8], expected: String) {
+    fn push(&mut self, name: &str, kind: &str, bytes: &[u8], expected: String) {
         self.0.push(format!(
-            "  {{\"name\": {}, \"type\": \"{ty}\", \"hex\": \"{}\", \"expected\": {expected}}}",
+            "  {{\"name\": {}, \"type\": \"{kind}\", \"hex\": \"{}\", \"expected\": {expected}}}",
             json_str(name),
             hex(bytes)
         ));
     }
 
-    fn hello(&mut self, name: &str, h: Hello<'_>) {
+    fn hello(&mut self, name: &str, hello: Hello<'_>) {
         let mut buf = Vec::new();
-        encode_hello(&h, &mut buf);
-        assert_eq!(decode_first(&buf).unwrap(), Frame::Hello(h));
-        let mode = match h.mode {
+        encode_hello(&hello, &mut buf);
+        assert_eq!(decode_first(&buf).unwrap(), Frame::Hello(hello));
+        let mode = match hello.mode {
             Mode::Bound { local, ipv6_only } => format!(
                 "\"mode\": \"bound\", \"localAddress\": {}, \"localPort\": {}, \"ipv6Only\": {}",
                 json_str(&local.ip().to_string()),
                 local.port(),
-                ipv6_only.map_or("null".to_string(), |b| b.to_string())
+                ipv6_only.map_or("null".to_string(), |only| only.to_string())
             ),
             Mode::Connected {
                 remote_host,
@@ -90,99 +90,102 @@ impl Vectors {
                 json_dns(dns_query_type)
             ),
         };
-        let exp = format!(
+        let expected = format!(
             "{{\"kind\": \"hello\", \"version\": {VERSION}, \"token\": \"{}\", \"sendBufferSize\": {}, \"receiveBufferSize\": {}, {mode}}}",
-            hex(&h.token),
-            h.send_buffer_size,
-            h.receive_buffer_size,
+            hex(&hello.token),
+            hello.send_buffer_size,
+            hello.receive_buffer_size,
         );
-        self.push(name, "first", &buf, exp);
+        self.push(name, "first", &buf, expected);
     }
 
-    fn bound(&mut self, name: &str, b: Bound) {
+    fn bound(&mut self, name: &str, bound: Bound) {
         let mut buf = Vec::new();
-        encode_bound(&b, &mut buf);
-        assert_eq!(decode_first(&buf).unwrap(), Frame::Bound(b.clone()));
-        let ifaces: Vec<_> = b.interface_addrs.iter().map(json_addr).collect();
-        let (remote_address, remote_port) = match b.remote {
-            Some(r) => (json_str(&r.ip().to_string()), r.port().to_string()),
+        encode_bound(&bound, &mut buf);
+        assert_eq!(decode_first(&buf).unwrap(), Frame::Bound(bound.clone()));
+        let ifaces: Vec<_> = bound.interface_addrs.iter().map(json_addr).collect();
+        let (remote_address, remote_port) = match bound.remote {
+            Some(remote) => (
+                json_str(&remote.ip().to_string()),
+                remote.port().to_string(),
+            ),
             None => ("null".to_string(), "null".to_string()),
         };
-        let exp = format!(
+        let expected = format!(
             "{{\"kind\": \"bound\", \"localAddress\": {}, \"localPort\": {}, \"remoteAddress\": {remote_address}, \"remotePort\": {remote_port}, \"maxGsoSegments\": {}, \"groSegments\": {}, \"interfaceAddrs\": [{}]}}",
-            json_str(&b.local.ip().to_string()),
-            b.local.port(),
-            b.max_gso_segments,
-            b.gro_segments,
+            json_str(&bound.local.ip().to_string()),
+            bound.local.port(),
+            bound.max_gso_segments,
+            bound.gro_segments,
             ifaces.join(", ")
         );
-        self.push(name, "first", &buf, exp);
+        self.push(name, "first", &buf, expected);
     }
 
-    fn error(&mut self, name: &str, e: ErrorFrame<'_>) {
+    fn error(&mut self, name: &str, error: ErrorFrame<'_>) {
         let mut buf = Vec::new();
-        encode_error(&e, &mut buf);
-        assert_eq!(decode_first(&buf).unwrap(), Frame::Error(e));
-        let exp = format!(
+        encode_error(&error, &mut buf);
+        assert_eq!(decode_first(&buf).unwrap(), Frame::Error(error));
+        let expected = format!(
             "{{\"kind\": \"error\", \"code\": {}, \"codeName\": \"{}\", \"message\": {}}}",
-            e.code as u8,
-            e.code.name(),
-            json_str(e.message)
+            error.code as u8,
+            error.code.name(),
+            json_str(error.message)
         );
-        self.push(name, "first", &buf, exp);
+        self.push(name, "first", &buf, expected);
     }
 
-    fn data(&mut self, name: &str, recs: &[Data<'_>]) {
+    fn data(&mut self, name: &str, records: &[Data<'_>]) {
         let mut buf = Vec::new();
-        for r in recs {
-            encode_data(r, &mut buf);
+        for record in records {
+            encode_data(record, &mut buf);
         }
         let decoded: Vec<_> = decode_data(&buf)
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(decoded, recs);
-        let items: Vec<_> = recs.iter().map(json_data).collect();
+        assert_eq!(decoded, records);
+        let items: Vec<_> = records.iter().map(json_data).collect();
         self.push(name, "data", &buf, format!("[{}]", items.join(", ")));
     }
 
     /// Page-to-host messages that may hold DATA_NAMED records.
-    fn records(&mut self, name: &str, recs: &[Record<'_>]) {
+    fn records(&mut self, name: &str, records: &[Record<'_>]) {
         let mut buf = Vec::new();
-        for r in recs {
-            match r {
-                Record::Data(d) => encode_data(d, &mut buf),
-                Record::Named(n) => encode_named_data(n, &mut buf),
+        for record in records {
+            match record {
+                Record::Data(data) => encode_data(data, &mut buf),
+                Record::Named(named) => encode_named_data(named, &mut buf),
             }
         }
         let decoded: Vec<_> = decode_records(&buf)
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(decoded, recs);
-        let items: Vec<_> = recs
+        assert_eq!(decoded, records);
+        let items: Vec<_> = records
             .iter()
-            .map(|r| match r {
-                Record::Data(d) => json_data(d),
-                Record::Named(n) => format!(
+            .map(|record| match record {
+                Record::Data(data) => json_data(data),
+                Record::Named(named) => format!(
                     "{{\"ecn\": {}, \"address\": {}, \"port\": {}, \"dnsQueryType\": {}, \"segmentSize\": {}, \"payload\": \"{}\"}}",
-                    n.ecn,
-                    json_str(n.host),
-                    n.port,
-                    json_dns(n.dns_query_type),
-                    n.segment_size,
-                    hex(n.payload)
+                    named.ecn,
+                    json_str(named.host),
+                    named.port,
+                    json_dns(named.dns_query_type),
+                    named.segment_size,
+                    hex(named.payload)
                 ),
             })
             .collect();
         self.push(name, "records", &buf, format!("[{}]", items.join(", ")));
     }
 
-    fn invalid(&mut self, name: &str, ty: &str, bytes: &[u8]) {
-        let err = match ty {
+    fn invalid(&mut self, name: &str, kind: &str, bytes: &[u8]) {
+        let err = match kind {
             "invalidFirst" => decode_first(bytes).unwrap_err(),
             "invalidData" => match decode_records(bytes) {
-                Err(e) => e,
+                Err(err) => err,
                 Ok(iter) => iter
                     .filter_map(Result::err)
                     .next()
@@ -192,7 +195,7 @@ impl Vectors {
         };
         self.push(
             name,
-            ty,
+            kind,
             bytes,
             format!("{{\"error\": \"{}\"}}", err.name()),
         );
@@ -200,13 +203,13 @@ impl Vectors {
 }
 
 fn build() -> String {
-    let mut v = Vectors(Vec::new());
+    let mut vectors = Vectors(Vec::new());
     let mut token = [0u8; TOKEN_LEN];
-    for (i, b) in token.iter_mut().enumerate() {
-        *b = (i as u8).wrapping_mul(7).wrapping_add(0xa0);
+    for (index, byte) in token.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(7).wrapping_add(0xa0);
     }
-    v.hello("hello v4 any", Hello::bind(token, addr("0.0.0.0:0")));
-    v.hello(
+    vectors.hello("hello v4 any", Hello::bind(token, addr("0.0.0.0:0")));
+    vectors.hello(
         "hello v6 any v6only",
         Hello {
             token: [0xff; 32],
@@ -218,7 +221,7 @@ fn build() -> String {
             receive_buffer_size: 0,
         },
     );
-    v.hello(
+    vectors.hello(
         "hello v6 any dual stack",
         Hello {
             token,
@@ -230,7 +233,7 @@ fn build() -> String {
             receive_buffer_size: 0,
         },
     );
-    v.hello(
+    vectors.hello(
         "hello v4 specific buffers",
         Hello {
             token,
@@ -242,11 +245,11 @@ fn build() -> String {
             receive_buffer_size: 4 << 20,
         },
     );
-    v.hello(
+    vectors.hello(
         "hello connected name",
         Hello::connect(token, "example.com", 443),
     );
-    v.hello(
+    vectors.hello(
         "hello connected name ipv6",
         Hello {
             token,
@@ -259,7 +262,7 @@ fn build() -> String {
             receive_buffer_size: 0,
         },
     );
-    v.hello(
+    vectors.hello(
         "hello connected ip literal ipv4",
         Hello {
             token,
@@ -272,11 +275,11 @@ fn build() -> String {
             receive_buffer_size: 0,
         },
     );
-    v.hello(
+    vectors.hello(
         "hello connected ipv6 literal",
         Hello::connect(token, "2001:db8::1", 4433),
     );
-    v.bound(
+    vectors.bound(
         "bound v4 no ifaces",
         Bound {
             local: addr("0.0.0.0:51820"),
@@ -286,7 +289,7 @@ fn build() -> String {
             interface_addrs: vec![],
         },
     );
-    v.bound(
+    vectors.bound(
         "bound v6 dual stack",
         Bound {
             local: addr("[::]:40000"),
@@ -300,7 +303,7 @@ fn build() -> String {
             ],
         },
     );
-    v.bound(
+    vectors.bound(
         "bound connected",
         Bound {
             local: addr("192.168.1.20:40001"),
@@ -310,28 +313,28 @@ fn build() -> String {
             interface_addrs: vec![addr("192.168.1.20:40001")],
         },
     );
-    v.error(
+    vectors.error(
         "error not allowed",
         ErrorFrame {
             code: ErrorCode::NotAllowed,
             message: "token expired",
         },
     );
-    v.error(
+    vectors.error(
         "error invalid input utf8",
         ErrorFrame {
             code: ErrorCode::InvalidInput,
             message: "forbidden destination \u{e9}\u{1f600}",
         },
     );
-    v.error(
+    vectors.error(
         "error io empty",
         ErrorFrame {
             code: ErrorCode::Io,
             message: "",
         },
     );
-    v.data(
+    vectors.data(
         "data single v4",
         &[Data {
             ecn: 0,
@@ -340,7 +343,7 @@ fn build() -> String {
             payload: b"hello",
         }],
     );
-    v.data(
+    vectors.data(
         "data single v6 ecn",
         &[Data {
             ecn: 2,
@@ -349,7 +352,7 @@ fn build() -> String {
             payload: &[0, 1, 2, 0xff],
         }],
     );
-    v.data(
+    vectors.data(
         "data empty payload",
         &[Data {
             ecn: 0,
@@ -358,7 +361,7 @@ fn build() -> String {
             payload: b"",
         }],
     );
-    v.data(
+    vectors.data(
         "data gso",
         &[Data {
             ecn: 1,
@@ -379,25 +382,25 @@ fn build() -> String {
         "[abcd:ef01:2345:6789:abcd:ef01:2345:6789]:65535",
         "[::1.2.3.4]:9",
     ];
-    let recs: Vec<_> = v6_forms
+    let records: Vec<_> = v6_forms
         .iter()
         .enumerate()
-        .map(|(i, a)| Data {
-            ecn: (i % 4) as u8,
-            peer: addr(a),
+        .map(|(index, text)| Data {
+            ecn: (index % 4) as u8,
+            peer: addr(text),
             segment_size: 0,
-            payload: &b"xyz"[..i % 4],
+            payload: &b"xyz"[..index % 4],
         })
         .collect();
-    v.data("data multi ipv6 text forms", &recs);
-    v.error(
+    vectors.data("data multi ipv6 text forms", &records);
+    vectors.error(
         "error name not resolved",
         ErrorFrame {
             code: ErrorCode::NameNotResolved,
             message: "no such host: nx.example",
         },
     );
-    v.records(
+    vectors.records(
         "records named",
         &[Record::Named(NamedData {
             ecn: 0,
@@ -408,7 +411,7 @@ fn build() -> String {
             payload: b"q",
         })],
     );
-    v.records(
+    vectors.records(
         "records named gso and data",
         &[
             Record::Named(NamedData {
@@ -436,10 +439,10 @@ fn build() -> String {
         ],
     );
 
-    v.invalid("first empty", "invalidFirst", &[]);
-    v.invalid("first unknown kind", "invalidFirst", &[0x42, 0]);
-    v.invalid("first data kind", "invalidFirst", &[KIND_DATA]);
-    v.invalid(
+    vectors.invalid("first empty", "invalidFirst", &[]);
+    vectors.invalid("first unknown kind", "invalidFirst", &[0x42, 0]);
+    vectors.invalid("first data kind", "invalidFirst", &[KIND_DATA]);
+    vectors.invalid(
         "first truncated hello",
         "invalidFirst",
         &[KIND_HELLO, VERSION, 0, 0],
@@ -451,77 +454,77 @@ fn build() -> String {
     };
     let mut bad_version = hello_head(1);
     bad_version.extend_from_slice(&[0, 4, 0, 0, 0, 0, 0, 0, 0]);
-    v.invalid("first bad version", "invalidFirst", &bad_version);
+    vectors.invalid("first bad version", "invalidFirst", &bad_version);
     let mut bad_family = hello_head(VERSION);
     bad_family.extend_from_slice(&[0, 5, 0, 0, 0, 0, 0, 0, 0]);
-    v.invalid("first bad family", "invalidFirst", &bad_family);
+    vectors.invalid("first bad family", "invalidFirst", &bad_family);
     let mut bad_mode = hello_head(VERSION);
     bad_mode.extend_from_slice(&[2, 4, 0, 0, 0, 0, 0, 0, 0]);
-    v.invalid("first unknown mode", "invalidFirst", &bad_mode);
+    vectors.invalid("first unknown mode", "invalidFirst", &bad_mode);
     let mut bad_v6only = hello_head(VERSION);
     bad_v6only.extend_from_slice(&[0, 4, 0, 0, 0, 0, 0, 0, 3]);
-    v.invalid("first bad ipv6only flag", "invalidFirst", &bad_v6only);
+    vectors.invalid("first bad ipv6only flag", "invalidFirst", &bad_v6only);
     let mut bad_dns = hello_head(VERSION);
     bad_dns.extend_from_slice(&[1, 5, 1, b'a', 0, 1]);
-    v.invalid("first bad dns query type", "invalidFirst", &bad_dns);
+    vectors.invalid("first bad dns query type", "invalidFirst", &bad_dns);
     let mut bad_host = hello_head(VERSION);
     bad_host.extend_from_slice(&[1, 0, 1, 0xff, 0, 1]);
-    v.invalid("first host not utf8", "invalidFirst", &bad_host);
+    vectors.invalid("first host not utf8", "invalidFirst", &bad_host);
     let mut truncated_host = hello_head(VERSION);
     truncated_host.extend_from_slice(&[1, 0, 5, b'a']);
-    v.invalid("first truncated host", "invalidFirst", &truncated_host);
-    v.invalid(
+    vectors.invalid("first truncated host", "invalidFirst", &truncated_host);
+    vectors.invalid(
         "first bad bound remote flag",
         "invalidFirst",
         &[KIND_BOUND, 4, 0, 0, 0, 0, 0, 1, 2, 0, 1, 0, 1, 0],
     );
-    v.invalid(
+    vectors.invalid(
         "first trailing",
         "invalidFirst",
         &[KIND_ERROR, 1, 0, 1, b'x', 0],
     );
-    v.invalid(
+    vectors.invalid(
         "first unknown error code",
         "invalidFirst",
         &[KIND_ERROR, 7, 0, 0],
     );
-    v.invalid(
+    vectors.invalid(
         "first bad utf8",
         "invalidFirst",
         &[KIND_ERROR, 1, 0, 1, 0xff],
     );
-    v.invalid("data empty", "invalidData", &[]);
-    v.invalid(
+    vectors.invalid("data empty", "invalidData", &[]);
+    vectors.invalid(
         "data truncated payload",
         "invalidData",
         &[KIND_DATA, 0, 4, 1, 2, 3, 4, 0, 1, 0, 0, 0, 0, 0, 5, b'a'],
     );
-    v.invalid(
+    vectors.invalid(
         "data bad ecn",
         "invalidData",
         &[KIND_DATA, 4, 4, 1, 2, 3, 4, 0, 1, 0, 0, 0, 0, 0, 0],
     );
-    v.invalid(
+    vectors.invalid(
         "data bad family",
         "invalidData",
         &[KIND_DATA, 0, 0, 1, 2, 3, 4, 0, 1, 0, 0, 0, 0, 0, 0],
     );
-    v.invalid(
+    vectors.invalid(
         "data then unknown kind",
         "invalidData",
         &[KIND_DATA, 0, 4, 1, 2, 3, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0x77],
     );
-    v.invalid(
+    vectors.invalid(
         "named bad dns query type",
         "invalidData",
         &[KIND_DATA_NAMED, 0, 9, 1, b'a', 0, 1, 0, 0, 0, 0, 0, 0],
     );
-    v.invalid(
+    vectors.invalid(
         "named truncated",
         "invalidData",
         &[KIND_DATA_NAMED, 0, 0, 3, b'a'],
     );
-    v.invalid(
+    vectors.invalid(
         "data then hello",
         "invalidData",
         &[
@@ -529,7 +532,7 @@ fn build() -> String {
         ],
     );
 
-    format!("[\n{}\n]\n", v.0.join(",\n"))
+    format!("[\n{}\n]\n", vectors.0.join(",\n"))
 }
 
 #[test]

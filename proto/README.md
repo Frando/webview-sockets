@@ -4,7 +4,7 @@ The wire format between a web page and the app hosting it. One WebSocket
 on `/.well-known/webview-sockets/udp` of the page's own origin carries one
 UDP socket: the page sends `HELLO`, the host answers `BOUND` or `ERROR`,
 then both sides exchange `DATA` messages with one or more datagrams. The
-Rust crate is `no_std` and zero-copy; [`js/codec.js`](js/codec.js) is the
+Rust crate is `no_std` and zero-copy. [`js/codec.js`](js/codec.js) is the
 same codec in JavaScript.
 
 ## Wire format v2
@@ -33,7 +33,7 @@ DATA_NAMED 0x11  u8 ecn  dns  host  u16 port  u16 segment_size  u32 len
   reports the peer in BOUND, and only talks to that peer.
 - `segment_size` 0 is one datagram, otherwise a GSO (page to host) or GRO
   (host to page) batch.
-- After BOUND, ERROR reports a failed send; the socket stays open.
+- After BOUND, ERROR reports a failed send. The socket stays open.
 - Close codes: 1000 normal, 4001 revoked, 4002 switched off, 4003 tab
   navigated or closed, 4004 limit, 4005 I/O error.
 
@@ -44,7 +44,7 @@ and encodes DATA with a non-IP `address` as DATA_NAMED.
 ## Session tokens
 
 The token comes from the platform bridge, not this protocol. The page sends
-`{"ns": "webview-sockets", "id": 1, "op": "requestSession"}`; the app
+`{"ns": "webview-sockets", "id": 1, "op": "requestSession"}`. The app
 answers `{"id": 1, "ok": true, "url": "ws://.../.well-known/webview-sockets/udp",
 "token": "<64 hex chars>"}` or `{"id": 1, "ok": false, "error": "NotAllowed"}`.
 

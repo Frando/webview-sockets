@@ -41,8 +41,8 @@ const webviewSocketsCodec = (() => {
     NORMAL: 1000, REVOKED: 4001, SETTING_OFF: 4002, NAVIGATED: 4003, LIMIT: 4004, IO_ERROR: 4005,
   };
 
-  const utf8Enc = new TextEncoder();
-  const utf8Dec = new TextDecoder("utf-8", { fatal: true });
+  const utf8Encoder = new TextEncoder();
+  const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
   function codecError(code, message) {
     const err = new Error(message);
@@ -57,38 +57,38 @@ const webviewSocketsCodec = (() => {
 
   // ---- addresses ----
 
-  function parseIpv4(s) {
-    const parts = s.split(".");
+  function parseIpv4(text) {
+    const parts = text.split(".");
     if (parts.length !== 4) return null;
     const out = new Uint8Array(4);
     for (let i = 0; i < 4; i++) {
       if (!/^(0|[1-9][0-9]{0,2})$/.test(parts[i])) return null;
-      const n = Number(parts[i]);
-      if (n > 255) return null;
-      out[i] = n;
+      const value = Number(parts[i]);
+      if (value > 255) return null;
+      out[i] = value;
     }
     return out;
   }
 
-  function parseIpv6(s) {
-    if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
-    const pct = s.indexOf("%");
-    if (pct >= 0) s = s.slice(0, pct);
-    const halves = s.split("::");
+  function parseIpv6(text) {
+    if (text.startsWith("[") && text.endsWith("]")) text = text.slice(1, -1);
+    const zone = text.indexOf("%");
+    if (zone >= 0) text = text.slice(0, zone);
+    const halves = text.split("::");
     if (halves.length > 2) return null;
     const groups = (str) => {
       if (str === "") return [];
       const words = [];
       const parts = str.split(":");
       for (let i = 0; i < parts.length; i++) {
-        const p = parts[i];
-        if (i === parts.length - 1 && p.includes(".")) {
-          const v4 = parseIpv4(p);
+        const part = parts[i];
+        if (i === parts.length - 1 && part.includes(".")) {
+          const v4 = parseIpv4(part);
           if (!v4) return null;
           words.push((v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]);
         } else {
-          if (!/^[0-9a-fA-F]{1,4}$/.test(p)) return null;
-          words.push(parseInt(p, 16));
+          if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return null;
+          words.push(parseInt(part, 16));
         }
       }
       return words;
@@ -106,23 +106,23 @@ const webviewSocketsCodec = (() => {
     }
     if (words.length !== 8) return null;
     const out = new Uint8Array(16);
-    words.forEach((w, i) => {
-      out[2 * i] = w >> 8;
-      out[2 * i + 1] = w & 0xff;
+    words.forEach((word, i) => {
+      out[2 * i] = word >> 8;
+      out[2 * i + 1] = word & 0xff;
     });
     return out;
   }
 
-  function formatIpv4(b) {
-    return `${b[0]}.${b[1]}.${b[2]}.${b[3]}`;
+  function formatIpv4(bytes) {
+    return `${bytes[0]}.${bytes[1]}.${bytes[2]}.${bytes[3]}`;
   }
 
-  function formatIpv6(b) {
+  function formatIpv6(bytes) {
     const words = [];
-    for (let i = 0; i < 8; i++) words.push((b[2 * i] << 8) | b[2 * i + 1]);
+    for (let i = 0; i < 8; i++) words.push((bytes[2 * i] << 8) | bytes[2 * i + 1]);
     // IPv4-mapped, like Rust's Display.
-    if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff) {
-      return "::ffff:" + formatIpv4(b.subarray(12, 16));
+    if (words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff) {
+      return "::ffff:" + formatIpv4(bytes.subarray(12, 16));
     }
     // Longest run of zero words (length >= 2, first wins).
     let bestStart = -1, bestLen = 0;
@@ -133,7 +133,7 @@ const webviewSocketsCodec = (() => {
       if (j - i > bestLen) { bestStart = i; bestLen = j - i; }
       i = j;
     }
-    const hex = (ws) => ws.map((w) => w.toString(16)).join(":");
+    const hex = (list) => list.map((word) => word.toString(16)).join(":");
     if (bestLen < 2) return hex(words);
     return hex(words.slice(0, bestStart)) + "::" + hex(words.slice(bestStart + bestLen));
   }
@@ -160,7 +160,7 @@ const webviewSocketsCodec = (() => {
   // Host name as UTF-8, cut to MAX_HOST_LEN at a char boundary like Rust.
   function hostBytes(host) {
     if (typeof host !== "string") throw invalid("host must be a string");
-    return cutUtf8(utf8Enc.encode(host), MAX_HOST_LEN);
+    return cutUtf8(utf8Encoder.encode(host), MAX_HOST_LEN);
   }
 
   function cutUtf8(bytes, max) {
@@ -172,15 +172,15 @@ const webviewSocketsCodec = (() => {
 
   function dnsByte(dnsQueryType) {
     if (dnsQueryType === undefined || dnsQueryType === null) return 0;
-    const b = DNS_TO_BYTE[dnsQueryType];
-    if (!b) throw invalid(`invalid dnsQueryType: ${dnsQueryType}`);
-    return b;
+    const byte = DNS_TO_BYTE[dnsQueryType];
+    if (!byte) throw invalid(`invalid dnsQueryType: ${dnsQueryType}`);
+    return byte;
   }
 
-  function checkU32(name, v) {
-    if (v === undefined || v === null) return 0;
-    if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) throw invalid(`invalid ${name}: ${v}`);
-    return v;
+  function checkU32(name, value) {
+    if (value === undefined || value === null) return 0;
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw invalid(`invalid ${name}: ${value}`);
+    return value;
   }
 
   function checkPort(port) {
@@ -196,15 +196,15 @@ const webviewSocketsCodec = (() => {
       this.view = new DataView(this.buf.buffer);
       this.pos = 0;
     }
-    u8(v) { this.buf[this.pos++] = v; }
-    u16(v) { this.view.setUint16(this.pos, v); this.pos += 2; }
-    u32(v) { this.view.setUint32(this.pos, v); this.pos += 4; }
-    bytes(b) { this.buf.set(b, this.pos); this.pos += b.length; }
-    addr(a) {
-      const ip = addrBytes(a);
+    u8(value) { this.buf[this.pos++] = value; }
+    u16(value) { this.view.setUint16(this.pos, value); this.pos += 2; }
+    u32(value) { this.view.setUint32(this.pos, value); this.pos += 4; }
+    bytes(bytes) { this.buf.set(bytes, this.pos); this.pos += bytes.length; }
+    addr(addr) {
+      const ip = addrBytes(addr);
       this.u8(ip.length === 4 ? 4 : 6);
       this.bytes(ip);
-      this.u16(checkPort(a.port));
+      this.u16(checkPort(addr.port));
     }
   }
 
@@ -215,20 +215,25 @@ const webviewSocketsCodec = (() => {
       this.pos = 0;
     }
     get remaining() { return this.buf.length - this.pos; }
-    need(n) { if (this.remaining < n) throw codecError("Truncated", "message truncated"); }
+    need(len) { if (this.remaining < len) throw codecError("Truncated", "message truncated"); }
     u8() { this.need(1); return this.buf[this.pos++]; }
-    u16() { this.need(2); const v = this.view.getUint16(this.pos); this.pos += 2; return v; }
-    u32() { this.need(4); const v = this.view.getUint32(this.pos); this.pos += 4; return v; }
-    take(n) { this.need(n); const b = this.buf.subarray(this.pos, this.pos + n); this.pos += n; return b; }
+    u16() { this.need(2); const value = this.view.getUint16(this.pos); this.pos += 2; return value; }
+    u32() { this.need(4); const value = this.view.getUint32(this.pos); this.pos += 4; return value; }
+    take(len) {
+      this.need(len);
+      const bytes = this.buf.subarray(this.pos, this.pos + len);
+      this.pos += len;
+      return bytes;
+    }
     dns() {
-      const b = this.u8();
-      if (!(b in BYTE_TO_DNS)) throw codecError("BadDnsQueryType", `bad dns query type ${b}`);
-      return BYTE_TO_DNS[b];
+      const byte = this.u8();
+      if (!(byte in BYTE_TO_DNS)) throw codecError("BadDnsQueryType", `bad dns query type ${byte}`);
+      return BYTE_TO_DNS[byte];
     }
     host() {
       const raw = this.take(this.u8());
       try {
-        return utf8Dec.decode(raw);
+        return utf8Decoder.decode(raw);
       } catch {
         throw codecError("InvalidUtf8", "string is not valid utf-8");
       }
@@ -247,7 +252,7 @@ const webviewSocketsCodec = (() => {
     if (data instanceof Uint8Array) return data;
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
     if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    if (typeof data === "string") return utf8Enc.encode(data);
+    if (typeof data === "string") return utf8Encoder.encode(data);
     throw invalid("data must be a Uint8Array, ArrayBuffer, ArrayBufferView or string");
   }
 
@@ -275,42 +280,42 @@ const webviewSocketsCodec = (() => {
   // Checks only what the wire needs; the Direct Sockets option rules are up to
   // the caller.
   function encodeHello(token, options = {}) {
-    const t = typeof token === "string" ? hexToBytes(token) : toBytes(token);
-    if (t.length !== TOKEN_LEN) throw invalid(`token must be ${TOKEN_LEN} bytes`);
+    const tokenBytes = typeof token === "string" ? hexToBytes(token) : toBytes(token);
+    if (tokenBytes.length !== TOKEN_LEN) throw invalid(`token must be ${TOKEN_LEN} bytes`);
     const sendBufferSize = checkU32("sendBufferSize", options.sendBufferSize);
     const receiveBufferSize = checkU32("receiveBufferSize", options.receiveBufferSize);
     const connected = options.remoteAddress !== undefined && options.remoteAddress !== null;
-    let w;
+    let writer;
     if (connected) {
       const host = hostBytes(options.remoteAddress);
       const dns = dnsByte(options.dnsQueryType);
-      w = new Writer(2 + TOKEN_LEN + 8 + 3 + host.length + 2);
-      head(w);
-      w.u8(MODE_CONNECTED);
-      w.u8(dns);
-      w.u8(host.length);
-      w.bytes(host);
-      w.u16(checkPort(options.remotePort));
+      writer = new Writer(2 + TOKEN_LEN + 8 + 3 + host.length + 2);
+      writeHead(writer);
+      writer.u8(MODE_CONNECTED);
+      writer.u8(dns);
+      writer.u8(host.length);
+      writer.bytes(host);
+      writer.u16(checkPort(options.remotePort));
     } else {
       const local = { address: options.localAddress ?? "0.0.0.0", port: options.localPort ?? 0 };
-      const v6only = options.ipv6Only;
-      if (v6only !== undefined && v6only !== null && typeof v6only !== "boolean") {
-        throw invalid(`invalid ipv6Only: ${v6only}`);
+      const ipv6Only = options.ipv6Only;
+      if (ipv6Only !== undefined && ipv6Only !== null && typeof ipv6Only !== "boolean") {
+        throw invalid(`invalid ipv6Only: ${ipv6Only}`);
       }
-      w = new Writer(2 + TOKEN_LEN + 8 + 1 + addrLen(local) + 1);
-      head(w);
-      w.u8(MODE_BOUND);
-      w.addr(local);
-      w.u8(v6only === true ? 2 : v6only === false ? 1 : 0);
+      writer = new Writer(2 + TOKEN_LEN + 8 + 1 + addrLen(local) + 1);
+      writeHead(writer);
+      writer.u8(MODE_BOUND);
+      writer.addr(local);
+      writer.u8(ipv6Only === true ? 2 : ipv6Only === false ? 1 : 0);
     }
-    return w.buf;
+    return writer.buf;
 
-    function head(w) {
-      w.u8(KIND_HELLO);
-      w.u8(VERSION);
-      w.bytes(t);
-      w.u32(sendBufferSize);
-      w.u32(receiveBufferSize);
+    function writeHead(writer) {
+      writer.u8(KIND_HELLO);
+      writer.u8(VERSION);
+      writer.bytes(tokenBytes);
+      writer.u32(sendBufferSize);
+      writer.u32(receiveBufferSize);
     }
   }
 
@@ -325,32 +330,32 @@ const webviewSocketsCodec = (() => {
     const remote = remoteAddress === null ? null : { address: remoteAddress, port: remotePort };
     const addrs = interfaceAddrs.slice(0, 255);
     const size = 1 + addrLen(local) + 1 + (remote ? addrLen(remote) : 0) + 5
-      + addrs.reduce((n, a) => n + addrLen(a), 0);
-    const w = new Writer(size);
-    w.u8(KIND_BOUND);
-    w.addr(local);
-    w.u8(remote ? 1 : 0);
-    if (remote) w.addr(remote);
-    w.u16(maxGsoSegments);
-    w.u16(groSegments);
-    w.u8(addrs.length);
-    addrs.forEach((a) => w.addr(a));
-    return w.buf;
+      + addrs.reduce((total, addr) => total + addrLen(addr), 0);
+    const writer = new Writer(size);
+    writer.u8(KIND_BOUND);
+    writer.addr(local);
+    writer.u8(remote ? 1 : 0);
+    if (remote) writer.addr(remote);
+    writer.u16(maxGsoSegments);
+    writer.u16(groSegments);
+    writer.u8(addrs.length);
+    addrs.forEach((addr) => writer.addr(addr));
+    return writer.buf;
   }
 
   // For tests and mock hosts. code: number or name, e.g. "InvalidInput".
   function encodeError(code, message = "") {
-    const num = typeof code === "number" ? code
-      : Number(Object.keys(ERROR_CODES).find((k) => ERROR_CODES[k] === code));
-    if (!ERROR_CODES[num]) throw invalid(`unknown error code ${code}`);
+    const number = typeof code === "number" ? code
+      : Number(Object.keys(ERROR_CODES).find((key) => ERROR_CODES[key] === code));
+    if (!ERROR_CODES[number]) throw invalid(`unknown error code ${code}`);
     // Cut at a char boundary, like the Rust encoder.
-    const m = cutUtf8(utf8Enc.encode(message), 0xffff);
-    const w = new Writer(4 + m.length);
-    w.u8(KIND_ERROR);
-    w.u8(num);
-    w.u16(m.length);
-    w.bytes(m);
-    return w.buf;
+    const messageBytes = cutUtf8(utf8Encoder.encode(message), 0xffff);
+    const writer = new Writer(4 + messageBytes.length);
+    writer.u8(KIND_ERROR);
+    writer.u8(number);
+    writer.u16(messageBytes.length);
+    writer.bytes(messageBytes);
+    return writer.buf;
   }
 
   // records: one record or an array of
@@ -362,45 +367,47 @@ const webviewSocketsCodec = (() => {
   // MAX_MESSAGE_LEN.
   function encodeData(records) {
     const list = Array.isArray(records) ? records : [records];
-    const prepared = list.map((r) => {
-      const payload = toBytes(r.payload);
-      const ip = ipLiteral(r.address);
-      if (!ip && typeof r.address === "string" && r.address.includes(":")) {
-        throw invalid(`invalid IP address: ${r.address}`);
+    const prepared = list.map((record) => {
+      const payload = toBytes(record.payload);
+      const ip = ipLiteral(record.address);
+      if (!ip && typeof record.address === "string" && record.address.includes(":")) {
+        throw invalid(`invalid IP address: ${record.address}`);
       }
-      if (ip) return { r, payload, ip, size: 8 + ip.length + 3 + payload.length };
-      const host = hostBytes(r.address);
+      if (ip) return { record, payload, ip, size: 8 + ip.length + 3 + payload.length };
+      const host = hostBytes(record.address);
       if (host.length === 0) throw invalid("address must not be empty");
-      return { r, payload, host, size: 12 + host.length + payload.length };
+      return { record, payload, host, size: 12 + host.length + payload.length };
     });
-    const size = prepared.reduce((n, p) => n + p.size, 0);
+    const size = prepared.reduce((total, entry) => total + entry.size, 0);
     if (size > MAX_MESSAGE_LEN) {
       throw codecError("Oversize", `message of ${size} bytes exceeds ${MAX_MESSAGE_LEN} bytes`);
     }
-    const w = new Writer(size);
-    for (const { r, payload, ip, host } of prepared) {
-      const seg = r.segmentSize ?? 0;
-      if (!Number.isInteger(seg) || seg < 0 || seg > 0xffff) throw invalid(`invalid segmentSize: ${seg}`);
-      const port = checkPort(r.port);
-      if (ip) {
-        w.u8(KIND_DATA);
-        w.u8((r.ecn ?? 0) & 3);
-        w.u8(ip.length === 4 ? 4 : 6);
-        w.bytes(ip);
-        w.u16(port);
-      } else {
-        w.u8(KIND_DATA_NAMED);
-        w.u8((r.ecn ?? 0) & 3);
-        w.u8(dnsByte(r.dnsQueryType));
-        w.u8(host.length);
-        w.bytes(host);
-        w.u16(port);
+    const writer = new Writer(size);
+    for (const { record, payload, ip, host } of prepared) {
+      const segmentSize = record.segmentSize ?? 0;
+      if (!Number.isInteger(segmentSize) || segmentSize < 0 || segmentSize > 0xffff) {
+        throw invalid(`invalid segmentSize: ${segmentSize}`);
       }
-      w.u16(seg);
-      w.u32(payload.length);
-      w.bytes(payload);
+      const port = checkPort(record.port);
+      if (ip) {
+        writer.u8(KIND_DATA);
+        writer.u8((record.ecn ?? 0) & 3);
+        writer.u8(ip.length === 4 ? 4 : 6);
+        writer.bytes(ip);
+        writer.u16(port);
+      } else {
+        writer.u8(KIND_DATA_NAMED);
+        writer.u8((record.ecn ?? 0) & 3);
+        writer.u8(dnsByte(record.dnsQueryType));
+        writer.u8(host.length);
+        writer.bytes(host);
+        writer.u16(port);
+      }
+      writer.u16(segmentSize);
+      writer.u32(payload.length);
+      writer.bytes(payload);
     }
-    return w.buf;
+    return writer.buf;
   }
 
   // ---- decoders ----
@@ -422,54 +429,54 @@ const webviewSocketsCodec = (() => {
   function decodeFirst(bytes) {
     bytes = toBytes(bytes);
     checkLen(bytes);
-    const r = new Reader(bytes);
-    const kind = r.u8();
+    const reader = new Reader(bytes);
+    const kind = reader.u8();
     let frame;
     if (kind === KIND_HELLO) {
-      const version = r.u8();
+      const version = reader.u8();
       if (version !== VERSION) throw codecError("UnsupportedVersion", `unsupported protocol version ${version}`);
-      const token = r.take(TOKEN_LEN);
-      const sendBufferSize = r.u32();
-      const receiveBufferSize = r.u32();
+      const token = reader.take(TOKEN_LEN);
+      const sendBufferSize = reader.u32();
+      const receiveBufferSize = reader.u32();
       frame = { kind: "hello", version, token, sendBufferSize, receiveBufferSize };
-      const mode = r.u8();
+      const mode = reader.u8();
       if (mode === MODE_BOUND) {
-        const local = r.addr();
-        const flag = r.u8();
+        const local = reader.addr();
+        const flag = reader.u8();
         if (flag > 2) throw codecError("BadFlag", `bad flag value ${flag}`);
         Object.assign(frame, {
           mode: "bound", localAddress: local.address, localPort: local.port,
           ipv6Only: flag === 0 ? null : flag === 2,
         });
       } else if (mode === MODE_CONNECTED) {
-        const dnsQueryType = r.dns();
-        const remoteAddress = r.host();
-        Object.assign(frame, { mode: "connected", remoteAddress, remotePort: r.u16(), dnsQueryType });
+        const dnsQueryType = reader.dns();
+        const remoteAddress = reader.host();
+        Object.assign(frame, { mode: "connected", remoteAddress, remotePort: reader.u16(), dnsQueryType });
       } else {
         throw codecError("UnknownMode", `unknown mode ${mode}`);
       }
     } else if (kind === KIND_BOUND) {
-      const local = r.addr();
-      const flag = r.u8();
+      const local = reader.addr();
+      const flag = reader.u8();
       if (flag > 1) throw codecError("BadFlag", `bad flag value ${flag}`);
-      const remote = flag === 1 ? r.addr() : null;
-      const maxGsoSegments = r.u16();
-      const groSegments = r.u16();
-      const n = r.u8();
+      const remote = flag === 1 ? reader.addr() : null;
+      const maxGsoSegments = reader.u16();
+      const groSegments = reader.u16();
+      const count = reader.u8();
       const interfaceAddrs = [];
-      for (let i = 0; i < n; i++) interfaceAddrs.push(r.addr());
+      for (let i = 0; i < count; i++) interfaceAddrs.push(reader.addr());
       frame = {
         kind: "bound", localAddress: local.address, localPort: local.port,
         remoteAddress: remote ? remote.address : null, remotePort: remote ? remote.port : null,
         maxGsoSegments, groSegments, interfaceAddrs,
       };
     } else if (kind === KIND_ERROR) {
-      const code = r.u8();
+      const code = reader.u8();
       if (!ERROR_CODES[code]) throw codecError("UnknownErrorCode", `unknown error code ${code}`);
-      const raw = r.take(r.u16());
+      const raw = reader.take(reader.u16());
       let message;
       try {
-        message = utf8Dec.decode(raw);
+        message = utf8Decoder.decode(raw);
       } catch {
         throw codecError("InvalidUtf8", "string is not valid utf-8");
       }
@@ -479,7 +486,7 @@ const webviewSocketsCodec = (() => {
     } else {
       throw codecError("UnknownKind", `unknown kind 0x${kind.toString(16)}`);
     }
-    if (r.remaining !== 0) throw codecError("TrailingBytes", "trailing bytes after frame");
+    if (reader.remaining !== 0) throw codecError("TrailingBytes", "trailing bytes after frame");
     return frame;
   }
 
@@ -491,29 +498,29 @@ const webviewSocketsCodec = (() => {
   function decodeData(bytes) {
     bytes = toBytes(bytes);
     checkLen(bytes);
-    const r = new Reader(bytes);
+    const reader = new Reader(bytes);
     const out = [];
-    while (r.remaining > 0) {
-      const kind = r.u8();
+    while (reader.remaining > 0) {
+      const kind = reader.u8();
       if (kind !== KIND_DATA && kind !== KIND_DATA_NAMED) {
         if (kind === KIND_HELLO || kind === KIND_BOUND || kind === KIND_ERROR) {
           throw codecError("UnexpectedKind", `unexpected kind 0x${kind.toString(16)}`);
         }
         throw codecError("UnknownKind", `unknown kind 0x${kind.toString(16)}`);
       }
-      const ecn = r.u8();
+      const ecn = reader.u8();
       if (ecn > 3) throw codecError("BadEcn", `bad ecn value ${ecn}`);
       if (kind === KIND_DATA) {
-        const { address, port } = r.addr();
-        const segmentSize = r.u16();
-        const payload = r.take(r.u32());
+        const { address, port } = reader.addr();
+        const segmentSize = reader.u16();
+        const payload = reader.take(reader.u32());
         out.push({ ecn, address, port, segmentSize, payload });
       } else {
-        const dnsQueryType = r.dns();
-        const address = r.host();
-        const port = r.u16();
-        const segmentSize = r.u16();
-        const payload = r.take(r.u32());
+        const dnsQueryType = reader.dns();
+        const address = reader.host();
+        const port = reader.u16();
+        const segmentSize = reader.u16();
+        const payload = reader.take(reader.u32());
         out.push({ ecn, address, port, dnsQueryType, segmentSize, payload });
       }
     }
