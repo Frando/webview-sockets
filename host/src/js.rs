@@ -1,26 +1,31 @@
-//! The injected script, assembled at compile time from `js/webview-sockets.js` and
-//! the proto crate's JS codec.
+//! The injected script, assembled at compile time.
+//!
+//! The script is `js/webview-sockets.js` with the JS codec of the proto crate
+//! inserted at the codec marker.
 
 use webview_sockets_proto::{JS_CODEC, JS_CODEC_EXPORT_MARKER};
 
 const HOST_JS: &str = include_str!("../js/webview-sockets.js");
 const CODEC_MARKER: &str = "// @@webview-sockets-codec@@";
 
-/// Returns the byte offset of `needle` in `haystack`; fails the build if
-/// it is missing.
+/// Returns the byte offset of `needle` in `haystack`.
+///
+/// # Panics
+///
+/// Panics if `needle` is missing. In a const context this fails the build.
 const fn find(haystack: &str, needle: &str) -> usize {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    let mut i = 0;
-    while i + n.len() <= h.len() {
-        let mut j = 0;
-        while j < n.len() && h[i + j] == n[j] {
-            j += 1;
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        let mut matched = 0;
+        while matched < needle.len() && haystack[start + matched] == needle[matched] {
+            matched += 1;
         }
-        if j == n.len() {
-            return i;
+        if matched == needle.len() {
+            return start;
         }
-        i += 1;
+        start += 1;
     }
     panic!("marker not found");
 }
@@ -36,20 +41,22 @@ const CODEC: &[u8] = JS_CODEC
     .0;
 const LEN: usize = HEAD.len() + CODEC.len() + TAIL.len();
 
+/// Returns the head of the host script, the codec and the tail of the host
+/// script as one array.
 const fn concat() -> [u8; LEN] {
     let mut out = [0u8; LEN];
     let parts = [HEAD, CODEC, TAIL];
     let mut pos = 0;
-    let mut p = 0;
-    while p < parts.len() {
-        let part = parts[p];
-        let mut i = 0;
-        while i < part.len() {
-            out[pos] = part[i];
+    let mut part_index = 0;
+    while part_index < parts.len() {
+        let part = parts[part_index];
+        let mut byte_index = 0;
+        while byte_index < part.len() {
+            out[pos] = part[byte_index];
             pos += 1;
-            i += 1;
+            byte_index += 1;
         }
-        p += 1;
+        part_index += 1;
     }
     out
 }
@@ -63,15 +70,18 @@ const HOSTS_LINE: &str = "const HOSTS = null; // @@webview-sockets-hosts@@";
 ///
 /// In the top frame of http(s) pages it defines `window.webviewSockets`
 /// with `version`, `udp.bind()`, `udp.connect()`, `UDPSocket` and
-/// `requestSession()`, and `window.UDPSocket`, a Direct Sockets
-/// compatibility layer, unless the browser has a native one. This variant runs on every host; see
-/// [`injected_js_for`] for one limited to some hosts. It talks to the
-/// platform over `window.webviewSocketsBridge` (Android web message
-/// listener) or `window.ipc.postMessage` (desktop, replies via
-/// `window.__webviewSocketsReply(id, json)`); requests are JSON
-/// `{"ns": "webview-sockets", "id", "op"}`, see [`crate::BridgeRequest`].
-/// Pages without either bridge fall back to
-/// `window.__webviewSocketsDevSession()` if defined (dev only).
+/// `requestSession()`. It also defines `window.UDPSocket`, a Direct Sockets
+/// compatibility layer, unless the browser has a native one.
+///
+/// This variant runs on every host. See [`injected_js_for`] for one limited
+/// to some hosts.
+///
+/// The script talks to the platform over `window.webviewSocketsBridge`
+/// (Android web message listener) or `window.ipc.postMessage` (desktop,
+/// replies through `window.__webviewSocketsReply(id, json)`). Requests are
+/// JSON `{"ns": "webview-sockets", "id", "op"}`, see
+/// [`crate::BridgeRequest`]. Pages without either bridge use
+/// `window.__webviewSocketsDevSession()` if it is defined (dev only).
 pub const INJECTED_JS: &str = match core::str::from_utf8(&BYTES) {
     Ok(s) => s,
     Err(_) => panic!("injected script is not utf-8"),

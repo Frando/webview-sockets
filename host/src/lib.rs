@@ -8,11 +8,10 @@
 //! [`webview_sockets_proto`].
 //!
 //! The script injected into pages ([`UdpHost::injected_js`], [`INJECTED_JS`])
-//! gives them `webviewSockets.udp` and a Direct Sockets `UDPSocket` layer:
-//! sockets bound to a local address, or connected to a remote host name or
-//! address that the host resolves. Its
-//! permission step asks the platform bridge ([`BridgeRequest`],
-//! [`bridge_reply`], [`reply_script`]).
+//! gives them `webviewSockets.udp` and a Direct Sockets `UDPSocket` layer.
+//! A socket is bound to a local address, or connected to a remote host name
+//! or address that the host resolves. To get permission, the script asks the
+//! platform bridge ([`BridgeRequest`], [`bridge_reply`], [`reply_script`]).
 //!
 //! Access is off by default ([`UdpHost::set_enabled`]) and granted per
 //! origin, either always (persisted) or once (until the tab navigates or
@@ -22,7 +21,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -58,20 +57,24 @@ pub struct Limits {
     pub max_sockets_per_tab: usize,
     /// Maximum concurrent sockets per origin, across all tabs.
     ///
-    /// A safety cap for an origin open in many tabs; keep it well above
+    /// A safety cap for an origin open in many tabs. Keep it well above
     /// [`Self::max_sockets_per_tab`].
     pub max_sockets_per_origin: usize,
     /// Maximum size of one WebSocket message in bytes.
     pub max_message_len: usize,
-    /// Number of received WebSocket messages (each up to 64 KiB) queued per
-    /// socket before further datagrams are dropped.
+    /// Number of received WebSocket messages queued per socket.
+    ///
+    /// Each message holds up to 64 KiB. When the queue is full, further
+    /// datagrams are dropped.
     pub recv_queue_len: usize,
     /// Time the page has to send HELLO after the WebSocket opened.
     pub hello_timeout: Duration,
     /// Time allowed for resolving a host name.
     pub resolve_timeout: Duration,
-    /// Upper bound for the kernel send and receive buffer sizes a page may
-    /// request; also the size used when the page requests none.
+    /// Upper bound for the kernel send and receive buffer sizes.
+    ///
+    /// A page may request smaller buffers. This is also the size used when
+    /// the page requests none.
     pub max_socket_buffer: usize,
 }
 
@@ -114,7 +117,7 @@ impl UdpHostConfig {
 /// Result of [`UdpHost::request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// The origin may use UDP; hand the ticket to the page.
+    /// The origin may use UDP. Hand the ticket to the page.
     Granted(SessionTicket),
     /// Ask the user, then call [`UdpHost::answer`].
     NeedPrompt,
@@ -157,7 +160,7 @@ pub struct SessionTicket {
 /// Host side of native UDP for web pages.
 ///
 /// Cheap to clone. All methods are synchronous and may be called from any
-/// thread; [`UdpHost::router`] must run on a tokio runtime.
+/// thread. [`UdpHost::router`] must run on a tokio runtime.
 #[derive(Debug, Clone)]
 pub struct UdpHost {
     inner: Arc<Inner>,
@@ -250,7 +253,7 @@ impl UdpHost {
         if !state.stored.enabled {
             return Decision::Disabled;
         }
-        if !self.origin_ok(origin) {
+        if !self.origin_allowed(origin) {
             debug!(%origin, "udp request from an origin the host policy denies");
             return Decision::Denied;
         }
@@ -269,7 +272,7 @@ impl UdpHost {
     /// Returns `None` for [`Choice::Block`], when the setting is off, or for
     /// an origin the [`HostPolicy`] denies.
     pub fn answer(&self, origin: &str, tab: TabId, choice: Choice) -> Option<SessionTicket> {
-        if !self.origin_ok(origin) {
+        if !self.origin_allowed(origin) {
             return None;
         }
         let mut state = self.inner.lock();
@@ -290,14 +293,19 @@ impl UdpHost {
             Choice::Block => {
                 state.stored.grants.insert(origin.to_string(), Grant::Block);
                 self.save(&state);
-                state.drop_where(|o, _| o == origin, close_code::REVOKED);
+                state.drop_where(
+                    |session_origin, _| session_origin == origin,
+                    close_code::REVOKED,
+                );
                 self.inner.update_active(&state);
                 None
             }
         }
     }
 
-    /// Returns whether the UDP setting is on. Off by default.
+    /// Returns whether the UDP setting is on.
+    ///
+    /// The setting is off by default.
     pub fn enabled(&self) -> bool {
         self.inner.lock().stored.enabled
     }
@@ -328,7 +336,7 @@ impl UdpHost {
             .stored
             .grants
             .iter()
-            .map(|(o, g)| (o.clone(), *g))
+            .map(|(origin, grant)| (origin.clone(), *grant))
             .collect()
     }
 
@@ -341,21 +349,26 @@ impl UdpHost {
         if state.stored.grants.remove(origin).is_some() {
             self.save(&state);
         }
-        state.once.retain(|(o, _)| o != origin);
-        state.drop_where(|o, _| o == origin, close_code::REVOKED);
+        state.once.retain(|(once_origin, _)| once_origin != origin);
+        state.drop_where(
+            |session_origin, _| session_origin == origin,
+            close_code::REVOKED,
+        );
         self.inner.update_active(&state);
     }
 
-    /// Call when the tab's main frame navigates (including reloads).
+    /// Ends the tab's grants and sockets when its main frame navigates.
     ///
-    /// Ends "allow once", invalidates the tab's tickets and closes its
-    /// sockets. The sockets no longer count towards [`Limits`] once this
+    /// Call it for every navigation, including reloads. It ends "allow
+    /// once", invalidates the tab's tickets and closes its sockets. The sockets no longer count towards [`Limits`] once this
     /// returns.
     pub fn tab_navigated(&self, tab: TabId) {
         self.end_tab(tab);
     }
 
-    /// Call when a tab is closed. Same effect as [`Self::tab_navigated`].
+    /// Ends the tab's grants and sockets when the tab is closed.
+    ///
+    /// It has the same effect as [`Self::tab_navigated`].
     pub fn tab_closed(&self, tab: TabId) {
         self.end_tab(tab);
     }
@@ -367,33 +380,36 @@ impl UdpHost {
 
     fn end_tab(&self, tab: TabId) {
         let mut state = self.inner.lock();
-        state.once.retain(|(_, t)| *t != tab);
-        state.drop_where(|_, t| t == tab, close_code::NAVIGATED);
+        state.once.retain(|(_, once_tab)| *once_tab != tab);
+        state.drop_where(|_, session_tab| session_tab == tab, close_code::NAVIGATED);
         self.inner.update_active(&state);
     }
 
-    fn origin_ok(&self, origin: &str) -> bool {
-        policy::origin_ok(origin, &self.inner.config.host_policy)
+    fn origin_allowed(&self, origin: &str) -> bool {
+        policy::origin_allowed(origin, &self.inner.config.host_policy)
     }
 
     fn save(&self, state: &State) {
         if let Err(err) = store::save(&self.inner.config.store_path, &state.stored) {
-            warn!(path = %self.inner.config.store_path.display(), "failed to save udp grants: {err:#}");
+            warn!(
+                path = %self.inner.config.store_path.display(),
+                "failed to save udp grants: {err:#}"
+            );
         }
     }
 }
 
 impl Inner {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("poisoned")
     }
 
     /// Updates the active tabs watch from the session table.
     fn update_active(&self, state: &State) {
-        let tabs: BTreeSet<TabId> = state.sessions.values().map(|s| s.tab).collect();
-        self.active.send_if_modified(|cur| {
-            if *cur != tabs {
-                *cur = tabs;
+        let tabs: BTreeSet<TabId> = state.sessions.values().map(|session| session.tab).collect();
+        self.active.send_if_modified(|current| {
+            if *current != tabs {
+                *current = tabs;
                 true
             } else {
                 false
@@ -403,12 +419,12 @@ impl Inner {
 }
 
 impl State {
-    /// Returns the ticket for (origin, tab), minting one if needed.
+    /// Returns the ticket for the origin and tab, and creates one if needed.
     fn ticket(&mut self, origin: &str, tab: TabId) -> SessionTicket {
         let existing = self
             .tickets
             .iter()
-            .find(|(_, t)| t.origin == origin && t.tab == tab)
+            .find(|(_, ticket)| ticket.origin == origin && ticket.tab == tab)
             .map(|(token, _)| *token);
         let token = existing.unwrap_or_else(|| {
             let token: Token = rand::random();
@@ -429,16 +445,17 @@ impl State {
 
     /// Invalidates matching tickets and closes matching sessions with `code`.
     ///
-    /// The sessions are removed right away, so they no longer count towards
-    /// the limits while their tasks wind down. Call
+    /// The sessions are removed at once, so they no longer count towards
+    /// the limits while their tasks end. Call
     /// [`Inner::update_active`] afterwards.
-    fn drop_where(&mut self, pred: impl Fn(&str, TabId) -> bool, code: u16) {
-        self.tickets.retain(|_, t| !pred(&t.origin, t.tab));
-        self.sessions.retain(|_, s| {
-            if !pred(&s.origin, s.tab) {
+    fn drop_where(&mut self, matches: impl Fn(&str, TabId) -> bool, code: u16) {
+        self.tickets
+            .retain(|_, ticket| !matches(&ticket.origin, ticket.tab));
+        self.sessions.retain(|_, session| {
+            if !matches(&session.origin, session.tab) {
                 return true;
             }
-            if let Some(close) = s.close.take() {
+            if let Some(close) = session.close.take() {
                 close.send(code).ok();
             }
             false
@@ -448,14 +465,14 @@ impl State {
 
 /// Returns the WebSocket URL for a page origin.
 fn ws_url(origin: &str) -> String {
-    let rest = origin
+    let base = origin
         .strip_prefix("http://")
-        .map(|r| format!("ws://{r}"))
+        .map(|authority| format!("ws://{authority}"))
         .or_else(|| {
             origin
                 .strip_prefix("https://")
-                .map(|r| format!("wss://{r}"))
+                .map(|authority| format!("wss://{authority}"))
         })
         .unwrap_or_else(|| origin.to_string());
-    format!("{rest}{WS_PATH}")
+    format!("{base}{WS_PATH}")
 }

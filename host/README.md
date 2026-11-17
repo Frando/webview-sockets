@@ -53,7 +53,7 @@ fn on_bridge(host: &UdpHost, origin: &str, tab: TabId, json: &str) -> Option<Str
 `HostPolicy::patterns` takes host authorities where `*` matches one label
 or port (`*.localhost:*`). It is checked on the bridge origin and on the
 WebSocket `Host`, and `Origin` must match `Host`. `HostPolicy::from_fn`
-takes any rule; `HostPolicy::Any` is for dev tools.
+takes any rule. `HostPolicy::Any` is for dev tools.
 
 ### Platform bridges
 
@@ -63,7 +63,7 @@ takes any rule; `HostPolicy::Any` is for dev tools.
   Ignore messages where `isMainFrame` is false, take the origin from
   `sourceOrigin` (trim the trailing `/`), and reply with `bridge_reply`.
   Call `tab_navigated` from `WebViewClient.onPageStarted`.
-- **wry:** inject with `with_initialization_script`; in the IPC handler,
+- **wry:** inject with `with_initialization_script`. In the IPC handler,
   `BridgeRequest::parse` the body (other messages are the app's own), take
   the origin from the request URI, and deliver the reply with
   `webview.evaluate_script(&reply_script(&origin, id, &reply))`, which only

@@ -30,10 +30,11 @@ fn gateway_policy() -> HostPolicy {
             .strip_suffix(".blake3.localhost")
             .or_else(|| name.strip_suffix(".pkarr.localhost"));
         port.parse::<u16>().is_ok()
-            && label.is_some_and(|l| {
-                !l.is_empty()
-                    && l.bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && label.is_some_and(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             })
     })
 }
@@ -341,7 +342,7 @@ async fn happy_path_echo() {
         bound
             .interface_addrs
             .iter()
-            .all(|a| a.port() == bound.local.port())
+            .all(|addr| addr.port() == bound.local.port())
     );
     assert_eq!(*env.host.active_tabs().borrow(), [TabId(1)].into());
 
@@ -357,7 +358,7 @@ async fn happy_path_echo() {
     ws.close(None).await.unwrap();
     tokio::time::timeout(TIMEOUT, async {
         let mut rx = env.host.active_tabs();
-        rx.wait_for(|t| t.is_empty()).await.unwrap();
+        rx.wait_for(|tabs| tabs.is_empty()).await.unwrap();
     })
     .await
     .unwrap();
@@ -427,7 +428,7 @@ async fn gso_send_splits_segments() {
         assert_eq!(from.port(), bound.local.port());
         got.push(buf[..n].to_vec());
     }
-    let expected: Vec<Vec<u8>> = payload.chunks(100).map(|c| c.to_vec()).collect();
+    let expected: Vec<Vec<u8>> = payload.chunks(100).map(<[u8]>::to_vec).collect();
     assert_eq!(got, expected);
 }
 
@@ -491,7 +492,7 @@ async fn revoke_and_tab_lifecycle_close_codes() {
 
     tokio::time::timeout(TIMEOUT, async {
         let mut rx = env.host.active_tabs();
-        rx.wait_for(|t| t.is_empty()).await.unwrap();
+        rx.wait_for(|tabs| tabs.is_empty()).await.unwrap();
     })
     .await
     .unwrap();
@@ -661,9 +662,10 @@ async fn per_origin_cap_across_tabs() {
     assert!(matches!(reply, Reply::Bound(_)));
 }
 
-/// Many tabs of one origin, two sockets each (like the iroh demo), stay
-/// within the default limits, and closing or navigating a tab frees its
-/// sockets at once.
+/// Checks that many tabs of one origin stay within the default limits.
+///
+/// Each tab has two sockets, like the iroh demo. Closing or navigating a
+/// tab frees its sockets at once.
 #[tokio::test]
 async fn tab_close_and_navigation_free_sockets() {
     let env = Env::with_limits(Limits {

@@ -1,10 +1,11 @@
 //! Dev server for pages using webview-sockets (`UDPSocket`) without an app.
 //!
-//! Serves a directory on 127.0.0.1 for any Host, mounts the UDP route, and
-//! serves the injected script at `/.well-known/webview-sockets/polyfill.js` with a dev
-//! adapter that gets sessions from `/.well-known/webview-sockets/dev-session`.
-//! Pages load it when `window.webviewSockets` is missing (it defines
-//! `UDPSocket` unless the browser has a native one):
+//! Serves a directory on 127.0.0.1 and mounts the UDP route. It also serves
+//! the injected script at `/.well-known/webview-sockets/polyfill.js`, with a
+//! dev adapter that gets sessions from
+//! `/.well-known/webview-sockets/dev-session`. Pages load the script when
+//! `window.webviewSockets` is missing. It defines `UDPSocket` unless the
+//! browser has a native one:
 //!
 //! ```html
 //! <script src="/.well-known/webview-sockets/polyfill.js"></script>
@@ -30,14 +31,16 @@ use webview_sockets_host::{
     Choice, Decision, HostPolicy, SessionTicket, TabId, UdpHost, UdpHostConfig, bridge_reply,
 };
 
-/// Prepended to the injected script: asks this server for a session when
-/// the page has no platform bridge.
+/// Script added before the injected script to get sessions from this server.
+///
+/// The injected script uses it when the page has no platform bridge.
 const DEV_ADAPTER: &str = r#"window.__webviewSocketsDevSession = async () => {
-  const r = await fetch("/.well-known/webview-sockets/dev-session", { method: "POST" });
-  return await r.json();
+  const response = await fetch("/.well-known/webview-sockets/dev-session", { method: "POST" });
+  return await response.json();
 };
 "#;
 
+/// Command line arguments.
 #[derive(Parser, Debug)]
 #[command(about = "Serve a directory with the webview-sockets host for testing")]
 struct Args {
@@ -58,6 +61,7 @@ struct Args {
     any_host: bool,
 }
 
+/// State shared by the HTTP handlers.
 #[derive(Clone)]
 struct AppState {
     host: UdpHost,
@@ -115,6 +119,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Serves the dev adapter and the injected script.
 async fn host_js(State(state): State<AppState>) -> impl IntoResponse {
     (
         [
@@ -125,9 +130,10 @@ async fn host_js(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Answers a session request from the dev adapter, like a platform bridge.
 async fn dev_session(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    let origin = match (get(header::ORIGIN), get(header::HOST)) {
+    let header_value = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    let origin = match (header_value(header::ORIGIN), header_value(header::HOST)) {
         (Some(origin), _) => origin.to_string(),
         (None, Some(host)) => format!("http://{host}"),
         (None, None) => return (StatusCode::BAD_REQUEST, "no origin".to_string()),
@@ -140,7 +146,7 @@ async fn dev_session(State(state): State<AppState>, headers: HeaderMap) -> impl 
             .answer(&origin, tab, Choice::AllowOnce)
             .ok_or("NotAllowed"),
         Decision::NeedPrompt => {
-            warn!(%origin, "udp session requested; run with --auto-grant to allow");
+            warn!(%origin, "udp session denied, run with --auto-grant to allow it");
             Err("NotAllowed")
         }
         Decision::Denied => Err("NotAllowed"),
@@ -149,6 +155,6 @@ async fn dev_session(State(state): State<AppState>, headers: HeaderMap) -> impl 
     info!(%origin, ok = result.is_ok(), "dev session");
     (
         StatusCode::OK,
-        bridge_reply(0, result.as_ref().map_err(|e| *e)),
+        bridge_reply(0, result.as_ref().map_err(|reason| *reason)),
     )
 }

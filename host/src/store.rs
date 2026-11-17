@@ -14,13 +14,15 @@ pub(crate) struct Stored {
     /// The UDP setting, off by default.
     #[serde(default)]
     pub(crate) enabled: bool,
-    /// Origin to grant.
+    /// The grant of each origin.
     #[serde(default)]
     pub(crate) grants: BTreeMap<String, Grant>,
 }
 
-/// Loads the store; a missing file yields the defaults, a corrupt one is
-/// logged and yields the defaults.
+/// Loads the store from `path`.
+///
+/// A missing file yields the defaults. A corrupt file is logged and also
+/// yields the defaults.
 pub(crate) fn load(path: &Path) -> Result<Stored> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -36,7 +38,7 @@ pub(crate) fn load(path: &Path) -> Result<Stored> {
     }
 }
 
-/// Writes the store atomically (temp file + rename).
+/// Writes the store atomically, to a temporary file that is then renamed.
 pub(crate) fn save(path: &Path, stored: &Stored) -> Result<()> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -44,8 +46,8 @@ pub(crate) fn save(path: &Path, stored: &Stored) -> Result<()> {
         std::fs::create_dir_all(dir).std_context("creating store dir")?;
     }
     let json = serde_json::to_vec_pretty(stored).std_context("encoding store")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).std_context(format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).std_context(format!("renaming to {}", path.display()))?;
+    let temp_path = path.with_extension("json.tmp");
+    std::fs::write(&temp_path, json).std_context(format!("writing {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, path).std_context(format!("renaming to {}", path.display()))?;
     Ok(())
 }

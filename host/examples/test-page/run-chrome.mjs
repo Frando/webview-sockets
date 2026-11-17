@@ -23,7 +23,7 @@ const proc = spawn(chrome, [
   `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, "about:blank",
 ], { stdio: "ignore" });
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let exitCode = 1;
 try {
   let target;
@@ -31,29 +31,31 @@ try {
     await sleep(100);
     try {
       const list = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
-      target = list.find((t) => t.type === "page");
+      target = list.find((entry) => entry.type === "page");
     } catch {}
   }
   if (!target) throw new Error("chrome did not start");
   const ws = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
+  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
   let id = 0;
   const waiting = new Map();
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.id && waiting.has(msg.id)) {
-      waiting.get(msg.id)(msg);
-      waiting.delete(msg.id);
-    } else if (msg.method === "Runtime.consoleAPICalled") {
-      console.log(`[console.${msg.params.type}]`, msg.params.args.map((a) => a.value ?? a.description).join(" "));
-    } else if (msg.method === "Runtime.exceptionThrown") {
-      console.log("[exception]", msg.params.exceptionDetails.exception?.description ?? msg.params.exceptionDetails.text);
+  ws.onmessage = (event) => {
+    const message = JSON.parse(event.data);
+    if (message.id && waiting.has(message.id)) {
+      waiting.get(message.id)(message);
+      waiting.delete(message.id);
+    } else if (message.method === "Runtime.consoleAPICalled") {
+      const args = message.params.args.map((arg) => arg.value ?? arg.description);
+      console.log(`[console.${message.params.type}]`, args.join(" "));
+    } else if (message.method === "Runtime.exceptionThrown") {
+      const details = message.params.exceptionDetails;
+      console.log("[exception]", details.exception?.description ?? details.text);
     }
   };
-  const call = (method, params = {}) => new Promise((r) => {
-    const n = ++id;
-    waiting.set(n, r);
-    ws.send(JSON.stringify({ id: n, method, params }));
+  const call = (method, params = {}) => new Promise((resolve) => {
+    const callId = ++id;
+    waiting.set(callId, resolve);
+    ws.send(JSON.stringify({ id: callId, method, params }));
   });
   await call("Runtime.enable");
   await call("Page.navigate", { url });
@@ -61,8 +63,8 @@ try {
   let title = "";
   while (Date.now() < deadline) {
     await sleep(200);
-    const r = await call("Runtime.evaluate", { expression: "document.title" });
-    title = r.result?.result?.value ?? "";
+    const reply = await call("Runtime.evaluate", { expression: "document.title" });
+    title = reply.result?.result?.value ?? "";
     if (title.startsWith(prefix)) break;
   }
   console.log(`title: ${title}`);

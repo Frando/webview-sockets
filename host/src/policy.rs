@@ -11,8 +11,8 @@ use std::{
 ///
 /// The host app passes its own rule, e.g. "only my gateway origins". The
 /// checked value is the `Host` authority as sent by the browser, with the
-/// port if the URL has one (`app.localhost:8080`). Independent of the policy,
-/// `Origin` must equal `"http://" + Host` or `"https://" + Host`.
+/// port if the URL has one (`app.localhost:8080`). Whatever the policy,
+/// `Origin` must be `http://` or `https://` followed by the `Host` value.
 #[derive(Clone)]
 pub enum HostPolicy {
     /// Any host. Only for dev tools.
@@ -24,9 +24,9 @@ pub enum HostPolicy {
 }
 
 impl HostPolicy {
-    /// Returns a policy that allows hosts for which `f` returns true.
-    pub fn from_fn(f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
-        Self::Only(Arc::new(f))
+    /// Returns a policy that allows hosts for which `allows` returns true.
+    pub fn from_fn(allows: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self::Only(Arc::new(allows))
     }
 
     /// Returns a policy that allows exactly the given host authorities.
@@ -39,7 +39,7 @@ impl HostPolicy {
     ///
     /// A pattern is a host authority in which `*` matches one or more
     /// characters other than `.` and `:`, e.g. `*.localhost:*` or
-    /// `app.localhost:8080`. Matching is case sensitive; browsers send
+    /// `app.localhost:8080`. Matching is case sensitive, and browsers send
     /// lowercase hosts. Unlike the other policies, the patterns also gate the
     /// injected script, see [`crate::UdpHost::injected_js`].
     pub fn patterns(patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -51,15 +51,18 @@ impl HostPolicy {
         !host.is_empty()
             && match self {
                 Self::Any => true,
-                Self::Only(f) => f(host),
-                Self::Patterns(patterns) => patterns.iter().any(|p| host_matches(p, host)),
+                Self::Only(allows) => allows(host),
+                Self::Patterns(patterns) => {
+                    patterns.iter().any(|pattern| host_matches(pattern, host))
+                }
             }
     }
 }
 
-/// Matches `host` against a pattern where `*` stands for one or more
-/// characters other than `.` and `:`. Mirrors `hostMatches` in the injected
-/// script.
+/// Returns whether `host` matches `pattern`.
+///
+/// A `*` in the pattern stands for one or more characters other than `.`
+/// and `:`. Mirrors `hostMatches` in the injected script.
 pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == host,
@@ -67,8 +70,8 @@ pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
             let Some(rest) = host.strip_prefix(head) else {
                 return false;
             };
-            let run = rest.find(['.', ':']).unwrap_or(rest.len());
-            (1..=run).any(|n| host_matches(tail, &rest[n..]))
+            let label_len = rest.find(['.', ':']).unwrap_or(rest.len());
+            (1..=label_len).any(|len| host_matches(tail, &rest[len..]))
         }
     }
 }
@@ -78,12 +81,15 @@ impl fmt::Debug for HostPolicy {
         match self {
             Self::Any => f.write_str("HostPolicy::Any"),
             Self::Only(_) => f.write_str("HostPolicy::Only(..)"),
-            Self::Patterns(p) => f.debug_tuple("HostPolicy::Patterns").field(p).finish(),
+            Self::Patterns(patterns) => f
+                .debug_tuple("HostPolicy::Patterns")
+                .field(patterns)
+                .finish(),
         }
     }
 }
 
-/// Splits an origin into its host authority, accepting `http` and `https`.
+/// Returns the host authority of an `http` or `https` origin.
 fn origin_host(origin: &str) -> Option<&str> {
     origin
         .strip_prefix("http://")
@@ -91,11 +97,11 @@ fn origin_host(origin: &str) -> Option<&str> {
 }
 
 /// Returns whether a bridge-reported origin may get a ticket.
-pub(crate) fn origin_ok(origin: &str, policy: &HostPolicy) -> bool {
+pub(crate) fn origin_allowed(origin: &str, policy: &HostPolicy) -> bool {
     origin_host(origin).is_some_and(|host| policy.allows(host))
 }
 
-/// Checks the WebSocket upgrade headers. Returns the origin on success.
+/// Checks the WebSocket upgrade headers and returns the origin.
 pub(crate) fn check_upgrade<'a>(
     host: Option<&str>,
     origin: Option<&'a str>,
@@ -107,7 +113,7 @@ pub(crate) fn check_upgrade<'a>(
         return Err("Host is not allowed");
     }
     match origin_host(origin) {
-        Some(o) if o == host => Ok(origin),
+        Some(origin_host) if origin_host == host => Ok(origin),
         _ => Err("Origin does not match Host"),
     }
 }
@@ -124,8 +130,9 @@ pub(crate) fn check_bind(addr: SocketAddr) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Checks a destination and returns it in canonical form (IPv4-mapped IPv6
-/// becomes IPv4).
+/// Checks a destination and returns it in canonical form.
+///
+/// An IPv4-mapped IPv6 address becomes an IPv4 address.
 pub(crate) fn check_destination(addr: SocketAddr) -> Result<SocketAddr, &'static str> {
     let ip = addr.ip().to_canonical();
     if addr.port() == 0 {
@@ -161,10 +168,11 @@ mod tests {
                 .strip_suffix(".blake3.localhost")
                 .or_else(|| name.strip_suffix(".pkarr.localhost"));
             port.parse::<u16>().is_ok()
-                && label.is_some_and(|l| {
-                    !l.is_empty()
-                        && l.bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && label.is_some_and(|label| {
+                    !label.is_empty()
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
                 })
         })
     }
@@ -178,74 +186,83 @@ mod tests {
         assert!(list.allows("b.localhost"));
         assert!(!list.allows("a.localhost:6"));
         assert!(!list.allows("a.localhost"));
-        let g = gateway();
-        assert!(g.allows("abc123.pkarr.localhost:45475"));
-        assert!(!g.allows("abc.pkarr.localhost"));
-        assert!(!g.allows("Abc.pkarr.localhost:80"));
-        let p = HostPolicy::patterns(["*.localhost:*", "app.test", "a*b.x"]);
-        assert!(p.allows("test.localhost:8080"));
-        assert!(!p.allows("a.b.localhost:8080"));
-        assert!(!p.allows(".localhost:8080"));
-        assert!(!p.allows("test.localhost"));
-        assert!(!p.allows("test.localhost:"));
-        assert!(p.allows("app.test"));
-        assert!(!p.allows("app.test:1"));
-        assert!(p.allows("axyb.x"));
-        assert!(!p.allows("ab.x"));
-        assert!(!p.allows("a.b.x"));
+        let gateway_policy = gateway();
+        assert!(gateway_policy.allows("abc123.pkarr.localhost:45475"));
+        assert!(!gateway_policy.allows("abc.pkarr.localhost"));
+        assert!(!gateway_policy.allows("Abc.pkarr.localhost:80"));
+        let patterns = HostPolicy::patterns(["*.localhost:*", "app.test", "a*b.x"]);
+        assert!(patterns.allows("test.localhost:8080"));
+        assert!(!patterns.allows("a.b.localhost:8080"));
+        assert!(!patterns.allows(".localhost:8080"));
+        assert!(!patterns.allows("test.localhost"));
+        assert!(!patterns.allows("test.localhost:"));
+        assert!(patterns.allows("app.test"));
+        assert!(!patterns.allows("app.test:1"));
+        assert!(patterns.allows("axyb.x"));
+        assert!(!patterns.allows("ab.x"));
+        assert!(!patterns.allows("a.b.x"));
     }
 
     #[test]
     fn origins() {
-        let g = gateway();
-        assert!(origin_ok("http://a.pkarr.localhost:5", &g));
-        assert!(origin_ok("https://a.pkarr.localhost:5", &g));
-        assert!(!origin_ok("ftp://a.pkarr.localhost:5", &g));
-        assert!(!origin_ok("http://example.com", &g));
-        assert!(!origin_ok("null", &HostPolicy::Any));
-        assert!(!origin_ok("http://", &HostPolicy::Any));
-        assert!(origin_ok("http://example.com", &HostPolicy::Any));
+        let gateway_policy = gateway();
+        assert!(origin_allowed(
+            "http://a.pkarr.localhost:5",
+            &gateway_policy
+        ));
+        assert!(origin_allowed(
+            "https://a.pkarr.localhost:5",
+            &gateway_policy
+        ));
+        assert!(!origin_allowed(
+            "ftp://a.pkarr.localhost:5",
+            &gateway_policy
+        ));
+        assert!(!origin_allowed("http://example.com", &gateway_policy));
+        assert!(!origin_allowed("null", &HostPolicy::Any));
+        assert!(!origin_allowed("http://", &HostPolicy::Any));
+        assert!(origin_allowed("http://example.com", &HostPolicy::Any));
     }
 
     #[test]
     fn upgrade() {
-        let g = gateway();
-        let h = Some("a.pkarr.localhost:5");
-        assert!(check_upgrade(h, Some("http://a.pkarr.localhost:5"), &g).is_ok());
-        assert!(check_upgrade(h, Some("https://a.pkarr.localhost:5"), &g).is_ok());
-        assert!(check_upgrade(h, Some("http://b.pkarr.localhost:5"), &g).is_err());
-        assert!(check_upgrade(h, Some("ws://a.pkarr.localhost:5"), &g).is_err());
-        assert!(check_upgrade(h, None, &g).is_err());
-        assert!(check_upgrade(None, Some("http://a.pkarr.localhost:5"), &g).is_err());
+        let gateway_policy = gateway();
+        let host = Some("a.pkarr.localhost:5");
+        assert!(check_upgrade(host, Some("http://a.pkarr.localhost:5"), &gateway_policy).is_ok());
+        assert!(check_upgrade(host, Some("https://a.pkarr.localhost:5"), &gateway_policy).is_ok());
+        assert!(check_upgrade(host, Some("http://b.pkarr.localhost:5"), &gateway_policy).is_err());
+        assert!(check_upgrade(host, Some("ws://a.pkarr.localhost:5"), &gateway_policy).is_err());
+        assert!(check_upgrade(host, None, &gateway_policy).is_err());
+        assert!(check_upgrade(None, Some("http://a.pkarr.localhost:5"), &gateway_policy).is_err());
         let ip = Some("127.0.0.1:5");
-        assert!(check_upgrade(ip, Some("http://127.0.0.1:5"), &g).is_err());
+        assert!(check_upgrade(ip, Some("http://127.0.0.1:5"), &gateway_policy).is_err());
         assert!(check_upgrade(ip, Some("http://127.0.0.1:5"), &HostPolicy::Any).is_ok());
     }
 
     #[test]
     fn destinations() {
-        let ok = |s: &str| check_destination(s.parse().unwrap());
-        assert!(ok("127.0.0.1:9").is_ok());
-        assert!(ok("[::1]:9").is_ok());
+        let check = |text: &str| check_destination(text.parse().unwrap());
+        assert!(check("127.0.0.1:9").is_ok());
+        assert!(check("[::1]:9").is_ok());
         assert_eq!(
-            ok("[::ffff:10.0.0.1]:9").unwrap(),
+            check("[::ffff:10.0.0.1]:9").unwrap(),
             "10.0.0.1:9".parse().unwrap()
         );
-        assert!(ok("10.0.0.1:0").is_err());
-        assert!(ok("0.0.0.0:9").is_err());
-        assert!(ok("[::]:9").is_err());
-        assert!(ok("224.0.0.1:9").is_err());
-        assert!(ok("[ff02::1]:9").is_err());
-        assert!(ok("255.255.255.255:9").is_err());
-        assert!(ok("[::ffff:255.255.255.255]:9").is_err());
+        assert!(check("10.0.0.1:0").is_err());
+        assert!(check("0.0.0.0:9").is_err());
+        assert!(check("[::]:9").is_err());
+        assert!(check("224.0.0.1:9").is_err());
+        assert!(check("[ff02::1]:9").is_err());
+        assert!(check("255.255.255.255:9").is_err());
+        assert!(check("[::ffff:255.255.255.255]:9").is_err());
     }
 
     #[test]
     fn binds() {
-        let ok = |s: &str| check_bind(s.parse().unwrap());
-        assert!(ok("0.0.0.0:0").is_ok());
-        assert!(ok("[::]:4433").is_ok());
-        assert!(ok("0.0.0.0:80").is_err());
-        assert!(ok("224.0.0.1:0").is_err());
+        let check = |text: &str| check_bind(text.parse().unwrap());
+        assert!(check("0.0.0.0:0").is_ok());
+        assert!(check("[::]:4433").is_ok());
+        assert!(check("0.0.0.0:80").is_err());
+        assert!(check("224.0.0.1:0").is_err());
     }
 }

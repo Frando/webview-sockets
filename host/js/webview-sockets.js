@@ -36,13 +36,13 @@
 
   // `*` in a pattern matches one or more characters other than "." and ":".
   function hostMatches(pattern, host) {
-    const re = pattern.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^.:]+");
-    return new RegExp(`^${re}$`).test(host);
+    const source = pattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^.:]+");
+    return new RegExp(`^${source}$`).test(host);
   }
 
   // @@webview-sockets-codec@@
 
-  const C = webviewSocketsCodec;
+  const codec = webviewSocketsCodec;
 
   // ---- platform bridge ----
 
@@ -59,10 +59,10 @@
       }
     }
     if (!reply || typeof reply !== "object") return;
-    const p = pending.get(reply.id);
-    if (!p) return;
+    const resolve = pending.get(reply.id);
+    if (!resolve) return;
     pending.delete(reply.id);
-    p(reply);
+    resolve(reply);
   }
 
   // Desktop: the host calls window.__webviewSocketsReply(id, json) via evaluate_script.
@@ -77,7 +77,7 @@
   // its reply {id, ok, url?, token?, error?}.
   function bridgeCall(op) {
     const id = nextId++;
-    const msg = JSON.stringify({ ns: "webview-sockets", id, op });
+    const message = JSON.stringify({ ns: "webview-sockets", id, op });
     const android = window.webviewSocketsBridge;
     if (android && typeof android.postMessage === "function") {
       if (!androidHooked) {
@@ -91,19 +91,19 @@
       }
       return new Promise((resolve) => {
         pending.set(id, resolve);
-        android.postMessage(msg);
+        android.postMessage(message);
       });
     }
     if (window.ipc && typeof window.ipc.postMessage === "function") {
       return new Promise((resolve) => {
         pending.set(id, resolve);
-        window.ipc.postMessage(msg);
+        window.ipc.postMessage(message);
       });
     }
     if (typeof window.__webviewSocketsDevSession === "function") {
       return Promise.resolve()
         .then(() => window.__webviewSocketsDevSession())
-        .then((r) => Object.assign({}, r, { id }), (e) => ({ id, ok: false, error: String(e) }));
+        .then((reply) => Object.assign({}, reply, { id }), (err) => ({ id, ok: false, error: String(err) }));
     }
     return Promise.resolve({ id, ok: false, error: "NotSupported" });
   }
@@ -126,7 +126,7 @@
     if (typeof reply.token !== "string" || !/^[0-9a-f]{64}$/.test(reply.token)) {
       throw domError("host returned a bad session token", "NotAllowedError");
     }
-    const url = reply.url || `ws://${location.host}${C.WS_PATH}`;
+    const url = reply.url || `ws://${location.host}${codec.WS_PATH}`;
     return { url, token: reply.token };
   }
 
@@ -144,21 +144,21 @@
   // ---- WebIDL-style option conversion ----
 
   function enforceRange(name, value, max) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) throw new TypeError(`${name} must be a finite number`);
-    const t = Math.trunc(n);
-    if (t < 0 || t > max) throw new TypeError(`${name} is out of range: ${value}`);
-    return t;
+    const number = Number(value);
+    if (!Number.isFinite(number)) throw new TypeError(`${name} must be a finite number`);
+    const integer = Math.trunc(number);
+    if (integer < 0 || integer > max) throw new TypeError(`${name} is out of range: ${value}`);
+    return integer;
   }
 
-  const port = (name, v) => (v === undefined ? undefined : enforceRange(name, v, 0xffff));
-  const u32 = (name, v) => (v === undefined ? undefined : enforceRange(name, v, 0xffffffff));
+  const port = (name, value) => (value === undefined ? undefined : enforceRange(name, value, 0xffff));
+  const u32 = (name, value) => (value === undefined ? undefined : enforceRange(name, value, 0xffffffff));
 
-  function dnsQueryType(v) {
-    if (v === undefined) return undefined;
-    const s = String(v);
-    if (s !== "ipv4" && s !== "ipv6") throw new TypeError(`invalid dnsQueryType: ${s}`);
-    return s;
+  function dnsQueryType(value) {
+    if (value === undefined) return undefined;
+    const text = String(value);
+    if (text !== "ipv4" && text !== "ipv6") throw new TypeError(`invalid dnsQueryType: ${text}`);
+    return text;
   }
 
   function isMulticast(ip) {
@@ -167,16 +167,16 @@
   }
 
   function isV4Mapped(ip) {
-    return ip.length === 16 && ip.subarray(0, 10).every((b) => b === 0) && ip[10] === 0xff && ip[11] === 0xff;
+    return ip.length === 16 && ip.subarray(0, 10).every((byte) => byte === 0) && ip[10] === 0xff && ip[11] === 0xff;
   }
 
   function isUnspecified(ip) {
-    return ip.every((b) => b === 0);
+    return ip.every((byte) => byte === 0);
   }
 
   function isBroadcast(ip) {
     const v4 = isV4Mapped(ip) ? ip.subarray(12) : ip;
-    return v4.length === 4 && v4.every((b) => b === 0xff);
+    return v4.length === 4 && v4.every((byte) => byte === 0xff);
   }
 
   // Converts and checks UDPSocketOptions like the Direct Sockets constructor.
@@ -185,7 +185,7 @@
     if (typeof options !== "object" && typeof options !== "function") {
       throw new TypeError("options must be an object");
     }
-    const o = {
+    const opts = {
       remoteAddress: options.remoteAddress === undefined ? undefined : String(options.remoteAddress),
       remotePort: port("remotePort", options.remotePort),
       localAddress: options.localAddress === undefined ? undefined : String(options.localAddress),
@@ -200,39 +200,39 @@
       || options.multicastLoopback !== undefined) {
       throw domError("multicast is not allowed", "NotAllowedError");
     }
-    if (o.remoteAddress !== undefined) {
-      const ip = C.ipLiteral(o.remoteAddress);
+    if (opts.remoteAddress !== undefined) {
+      const ip = codec.ipLiteral(opts.remoteAddress);
       if (ip && isMulticast(ip)) throw domError("multicast is not allowed", "NotAllowedError");
     }
-    if ((o.remoteAddress === undefined) !== (o.remotePort === undefined)) {
+    if ((opts.remoteAddress === undefined) !== (opts.remotePort === undefined)) {
       throw new TypeError("remoteAddress and remotePort must be given together");
     }
-    const connected = o.remoteAddress !== undefined;
-    if (o.localPort !== undefined) {
-      if (o.localPort === 0) throw new TypeError("localPort must not be 0");
-      if (o.localAddress === undefined) throw new TypeError("localPort needs localAddress");
+    const connected = opts.remoteAddress !== undefined;
+    if (opts.localPort !== undefined) {
+      if (opts.localPort === 0) throw new TypeError("localPort must not be 0");
+      if (opts.localAddress === undefined) throw new TypeError("localPort needs localAddress");
     }
-    if (o.localAddress !== undefined) {
+    if (opts.localAddress !== undefined) {
       if (connected) throw new TypeError("localAddress cannot be combined with remoteAddress");
-      if (!C.ipLiteral(o.localAddress)) throw new TypeError(`invalid localAddress: ${o.localAddress}`);
+      if (!codec.ipLiteral(opts.localAddress)) throw new TypeError(`invalid localAddress: ${opts.localAddress}`);
     }
-    if (!connected && o.localAddress === undefined) {
+    if (!connected && opts.localAddress === undefined) {
       throw new TypeError("either remoteAddress and remotePort or localAddress is required");
     }
-    if (!connected && o.dnsQueryType !== undefined) {
+    if (!connected && opts.dnsQueryType !== undefined) {
       throw new TypeError("dnsQueryType is only allowed with remoteAddress");
     }
-    if (o.ipv6Only !== undefined) {
+    if (opts.ipv6Only !== undefined) {
       if (connected) throw new TypeError("ipv6Only is only allowed with localAddress");
-      const ip = C.ipLiteral(o.localAddress);
+      const ip = codec.ipLiteral(opts.localAddress);
       if (ip.length !== 16 || !isUnspecified(ip)) {
         throw new TypeError("ipv6Only needs localAddress \"::\"");
       }
     }
-    if (o.sendBufferSize === 0) throw new TypeError("sendBufferSize must not be 0");
-    if (o.receiveBufferSize === 0) throw new TypeError("receiveBufferSize must not be 0");
-    o.connected = connected;
-    return o;
+    if (opts.sendBufferSize === 0) throw new TypeError("sendBufferSize must not be 0");
+    if (opts.receiveBufferSize === 0) throw new TypeError("receiveBufferSize must not be 0");
+    opts.connected = connected;
+    return opts;
   }
 
   // ---- errors ----
@@ -253,16 +253,16 @@
   }
 
   function closeError(code, reason) {
-    const K = C.CLOSE_CODES;
-    const what = {
-      [K.REVOKED]: "socket access was revoked",
-      [K.SETTING_OFF]: "sockets were turned off in the app settings",
-      [K.NAVIGATED]: "the page navigated",
-      [K.LIMIT]: "a host limit was exceeded",
-      [K.IO_ERROR]: "the host socket failed",
+    const codes = codec.CLOSE_CODES;
+    const message = {
+      [codes.REVOKED]: "socket access was revoked",
+      [codes.SETTING_OFF]: "sockets were turned off in the app settings",
+      [codes.NAVIGATED]: "the page navigated",
+      [codes.LIMIT]: "a host limit was exceeded",
+      [codes.IO_ERROR]: "the host socket failed",
     }[code] || `connection to the host closed (${code}${reason ? ` ${reason}` : ""})`;
-    const name = code === K.REVOKED || code === K.SETTING_OFF ? "NotAllowedError" : "NetworkError";
-    return domError(what, name);
+    const name = code === codes.REVOKED || code === codes.SETTING_OFF ? "NotAllowedError" : "NetworkError";
+    return domError(message, name);
   }
 
   // ---- fast socket ----
@@ -334,21 +334,21 @@
           const at = this._reserve(11 + ip.length + payload.length);
           const buf = this._buf;
           const view = this._view;
-          buf[at] = C.KIND_DATA;
+          buf[at] = codec.KIND_DATA;
           buf[at + 1] = ecn;
           buf[at + 2] = ip.length === 4 ? 4 : 6;
           buf.set(ip, at + 3);
-          const p = at + 3 + ip.length;
-          view.setUint16(p, port);
-          view.setUint16(p + 2, segmentSize);
-          view.setUint32(p + 4, payload.length);
-          buf.set(payload, p + 8);
+          const portAt = at + 3 + ip.length;
+          view.setUint16(portAt, port);
+          view.setUint16(portAt + 2, segmentSize);
+          view.setUint32(portAt + 4, payload.length);
+          buf.set(payload, portAt + 8);
           this._scheduleFlush();
           return;
         }
       }
       // Host names, strings and anything to validate: the generic encoder.
-      const bytes = C.encodeData({
+      const bytes = codec.encodeData({
         address, port, payload: data, ecn, segmentSize, dnsQueryType: opts ? opts.dnsQueryType : undefined,
       });
       const at = this._reserve(bytes.length);
@@ -364,7 +364,7 @@
 
     _destIp(address) {
       if (address !== this._lastAddress) {
-        this._lastIp = C.ipLiteral(address);
+        this._lastIp = codec.ipLiteral(address);
         this._lastAddress = address;
       }
       return this._lastIp;
@@ -373,12 +373,12 @@
     // Returns the offset of `size` free bytes in the batch buffer, sending
     // the batch first if they do not fit.
     _reserve(size) {
-      if (size > C.MAX_MESSAGE_LEN) {
-        throw new TypeError(`datagram of ${size} bytes exceeds ${C.MAX_MESSAGE_LEN} bytes`);
+      if (size > codec.MAX_MESSAGE_LEN) {
+        throw new TypeError(`datagram of ${size} bytes exceeds ${codec.MAX_MESSAGE_LEN} bytes`);
       }
-      if (this._queued + size > C.MAX_MESSAGE_LEN) this._flush();
+      if (this._queued + size > codec.MAX_MESSAGE_LEN) this._flush();
       if (!this._buf) {
-        this._buf = new Uint8Array(C.MAX_MESSAGE_LEN);
+        this._buf = new Uint8Array(codec.MAX_MESSAGE_LEN);
         this._view = new DataView(this._buf.buffer);
       }
       const at = this._queued;
@@ -404,10 +404,10 @@
 
     _onMessage(data) {
       const bytes = new Uint8Array(data);
-      if (bytes[0] === C.KIND_ERROR) {
+      if (bytes[0] === codec.KIND_ERROR) {
         let err;
         try {
-          err = frameError(C.decodeFirst(bytes));
+          err = frameError(codec.decodeFirst(bytes));
         } catch {
           return this._protocolError();
         }
@@ -433,7 +433,7 @@
       while (pos < end) {
         const family = bytes[pos + 2];
         const ipLen = family === 4 ? 4 : family === 6 ? 16 : 0;
-        if (bytes[pos] !== C.KIND_DATA || !ipLen || bytes[pos + 1] > 3) throw new ProtocolError();
+        if (bytes[pos] !== codec.KIND_DATA || !ipLen || bytes[pos + 1] > 3) throw new ProtocolError();
         const head = pos + 3 + ipLen + 8;
         if (head > end) throw new ProtocolError();
         pos = head + view.getUint32(head - 4);
@@ -444,22 +444,23 @@
         const ecn = bytes[pos + 1];
         const ipAt = pos + 3;
         const ipLen = bytes[pos + 2] === 4 ? 4 : 16;
-        const p = ipAt + ipLen;
-        const port = view.getUint16(p);
-        const segmentSize = view.getUint16(p + 2);
-        const len = view.getUint32(p + 4);
-        const start = p + 8;
+        const portAt = ipAt + ipLen;
+        const port = view.getUint16(portAt);
+        const segmentSize = view.getUint16(portAt + 2);
+        const len = view.getUint32(portAt + 4);
+        const start = portAt + 8;
         pos = start + len;
         const onmessage = this.onmessage;
         if (!onmessage) continue;
         const address = this._fromText(bytes, ipAt, ipLen);
         if (gro || !segmentSize || len <= segmentSize) {
-          const msg = { data: len ? bytes.subarray(start, start + len) : EMPTY, address, port, ecn };
-          if (gro && segmentSize && len > segmentSize) msg.segmentSize = segmentSize;
-          onmessage(msg);
+          const message = { data: len ? bytes.subarray(start, start + len) : EMPTY, address, port, ecn };
+          if (gro && segmentSize && len > segmentSize) message.segmentSize = segmentSize;
+          onmessage(message);
         } else {
-          for (let off = 0; off < len; off += segmentSize) {
-            onmessage({ data: bytes.subarray(start + off, start + Math.min(off + segmentSize, len)), address, port, ecn });
+          for (let offset = 0; offset < len; offset += segmentSize) {
+            const end = start + Math.min(offset + segmentSize, len);
+            onmessage({ data: bytes.subarray(start + offset, end), address, port, ecn });
           }
         }
       }
@@ -473,7 +474,7 @@
         const ip = bytes.subarray(at, at + len);
         last.set(ip);
         this._lastFromLen = len;
-        this._lastFromText = len === 4 ? `${ip[0]}.${ip[1]}.${ip[2]}.${ip[3]}` : C.formatIpv6(ip);
+        this._lastFromText = len === 4 ? `${ip[0]}.${ip[1]}.${ip[2]}.${ip[3]}` : codec.formatIpv6(ip);
       }
       return this._lastFromText;
     }
@@ -498,9 +499,9 @@
   // fresh session if the token went stale.
   async function open(helloOptions, gro) {
     for (let attempt = 0; ; attempt++) {
-      const s = await getSession();
-      const hello = C.encodeHello(s.token, helloOptions);
-      const result = await handshake(s.url, hello);
+      const current = await getSession();
+      const hello = codec.encodeHello(current.token, helloOptions);
+      const result = await handshake(current.url, hello);
       if (result.ws) return new Socket(result.ws, result.frame, gro);
       if (result.stale && attempt === 0) {
         session = null;
@@ -525,7 +526,7 @@
         ws.onmessage = null;
         let frame;
         try {
-          frame = C.decodeFirst(new Uint8Array(event.data));
+          frame = codec.decodeFirst(new Uint8Array(event.data));
         } catch (err) {
           ws.close(1002);
           resolve({ error: domError(`bad reply from host: ${err.message}`, "NetworkError") });
@@ -565,27 +566,27 @@
 
   // Datagrams queued in the readable before further ones are dropped.
   const RECV_QUEUE_LEN = 4096;
-  // Writes wait while more than this many bytes are unsent ...
+  // Writes wait while more than this many bytes are unsent.
   const SEND_HIGH = 1024 * 1024;
-  // ... until the backlog is below this.
+  // Waiting writes resume when the backlog is below this many bytes.
   const SEND_LOW = 256 * 1024;
 
   function deferred() {
     let resolve, reject;
-    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    const promise = new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
     promise.catch(() => {});
     return { promise, resolve, reject, settled: false };
   }
 
-  function settle(d, ok, value) {
-    if (d.settled) return;
-    d.settled = true;
-    if (ok) d.resolve(value);
-    else d.reject(value);
+  function settle(pending, ok, value) {
+    if (pending.settled) return;
+    pending.settled = true;
+    if (ok) pending.resolve(value);
+    else pending.reject(value);
   }
 
-  // State of one UDPSocket, kept out of the public object.
-  class Conn {
+  // The state of one UDPSocket, kept out of the public object.
+  class Connection {
     constructor(socket, opts) {
       this.socket = socket;
       this.opts = opts;
@@ -594,8 +595,8 @@
       this.sock = null;
       this.readable = null;
       this.writable = null;
-      this.rc = null;
-      this.wc = null;
+      this.readableController = null;
+      this.writableController = null;
       this.readDone = false;
       this.writeDone = false;
       this.writeError = null;
@@ -603,12 +604,12 @@
     }
 
     async open() {
-      const o = this.opts;
+      const opts = this.opts;
       let sock;
       try {
-        sock = o.connected
-          ? await connect(o.remoteAddress, o.remotePort, o)
-          : await bind({ ...o, localPort: o.localPort ?? 0 });
+        sock = opts.connected
+          ? await connect(opts.remoteAddress, opts.remotePort, opts)
+          : await bind({ ...opts, localPort: opts.localPort ?? 0 });
       } catch (err) {
         this.error = err.name === "UdpCodecError" ? new TypeError(err.message) : err;
         settle(this.opened, false, this.error);
@@ -616,35 +617,35 @@
         return;
       }
       this.sock = sock;
-      const connected = o.connected;
-      sock.onmessage = (m) => {
-        const rc = this.rc;
-        if (this.readDone || rc.desiredSize <= 0) return; // reader too slow: drop
+      const connected = opts.connected;
+      sock.onmessage = (received) => {
+        const controller = this.readableController;
+        if (this.readDone || controller.desiredSize <= 0) return; // reader too slow: drop
         // Copy: chunks own their buffer, so a reader may transfer it.
-        const msg = { data: m.data.slice() };
+        const message = { data: received.data.slice() };
         if (!connected) {
-          msg.remoteAddress = m.address;
-          msg.remotePort = m.port;
+          message.remoteAddress = received.address;
+          message.remotePort = received.port;
         }
-        if (m.ecn) msg.ecn = m.ecn;
-        if (m.segmentSize) msg.segmentSize = m.segmentSize;
-        rc.enqueue(msg);
+        if (received.ecn) message.ecn = received.ecn;
+        if (received.segmentSize) message.segmentSize = received.segmentSize;
+        controller.enqueue(message);
       };
-      sock.onerror = (e) => {
+      sock.onerror = (event) => {
         const handler = this.socket.onsenderror;
-        if (typeof handler === "function") handler.call(this.socket, e.error);
-        else console.warn(`UDPSocket: send failed: ${e.name}: ${e.message}`);
+        if (typeof handler === "function") handler.call(this.socket, event.error);
+        else console.warn(`UDPSocket: send failed: ${event.name}: ${event.message}`);
       };
-      sock.onclose = (e) => this.fail(e.error || domError("socket closed", "NetworkError"));
+      sock.onclose = (event) => this.fail(event.error || domError("socket closed", "NetworkError"));
       this.readable = new ReadableStream({
-        start: (c) => { this.rc = c; },
+        start: (controller) => { this.readableController = controller; },
         cancel: () => {
           this.readDone = true;
           this.maybeClose();
         },
       }, { highWaterMark: RECV_QUEUE_LEN });
       this.writable = new WritableStream({
-        start: (c) => { this.wc = c; },
+        start: (controller) => { this.writableController = controller; },
         write: (chunk) => {
           try {
             return this.write(chunk);
@@ -685,8 +686,8 @@
       this.error = err;
       this.readDone = true;
       this.writeDone = true;
-      try { this.rc.error(err); } catch {}
-      try { this.wc.error(err); } catch {}
+      try { this.readableController.error(err); } catch {}
+      try { this.writableController.error(err); } catch {}
       if (!this.sock.closed) this.sock.close();
       settle(this.closed, false, err);
     }
@@ -755,44 +756,44 @@
     }
   }
 
-  const conns = new WeakMap();
+  const connections = new WeakMap();
 
-  function connOf(socket) {
-    const conn = conns.get(socket);
-    if (!conn) throw new TypeError("illegal invocation");
-    return conn;
+  function connectionOf(socket) {
+    const connection = connections.get(socket);
+    if (!connection) throw new TypeError("illegal invocation");
+    return connection;
   }
 
   class UDPSocket {
     constructor(options = {}) {
       const opts = parseOptions(options);
-      const conn = new Conn(this, opts);
-      conns.set(this, conn);
+      const connection = new Connection(this, opts);
+      connections.set(this, connection);
       // Non-standard: failed sends after the write resolved.
       this.onsenderror = null;
-      conn.open();
+      connection.open();
     }
 
     get opened() {
-      return connOf(this).opened.promise;
+      return connectionOf(this).opened.promise;
     }
 
     get closed() {
-      return connOf(this).closed.promise;
+      return connectionOf(this).closed.promise;
     }
 
     close() {
-      const conn = connOf(this);
-      if (!conn.opened.settled || !conn.sock) {
+      const connection = connectionOf(this);
+      if (!connection.opened.settled || !connection.sock) {
         return Promise.reject(domError("socket is not open", "InvalidStateError"));
       }
-      if (conn.closed.settled) return conn.closed.promise;
-      if (conn.readable.locked || conn.writable.locked) {
+      if (connection.closed.settled) return connection.closed.promise;
+      if (connection.readable.locked || connection.writable.locked) {
         return Promise.reject(domError("readable or writable is locked", "InvalidStateError"));
       }
-      conn.readable.cancel().catch(() => {});
-      conn.writable.abort().catch(() => {});
-      return conn.closed.promise;
+      connection.readable.cancel().catch(() => {});
+      connection.writable.abort().catch(() => {});
+      return connection.closed.promise;
     }
   }
 
@@ -805,7 +806,7 @@
   }
   const udp = Object.freeze({ bind, connect });
   Object.defineProperty(window, "webviewSockets", {
-    value: Object.freeze({ version: C.VERSION, udp, UDPSocket, requestSession }),
+    value: Object.freeze({ version: codec.VERSION, udp, UDPSocket, requestSession }),
     enumerable: true,
   });
 })();

@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     io::{self, IoSliceMut},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,11 +19,9 @@ use axum::{
     routing::get,
 };
 use noq_udp::RecvMeta;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
-use tracing::{Instrument, debug, info_span, trace, warn};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::{Instrument, Span, debug, field, info_span, trace, warn};
 use webview_sockets_proto::{
     Bound, Data, DnsQueryType, ErrorCode, ErrorFrame, Frame, Mode, Record, WS_PATH, close_code,
     decode_first, decode_records, encode_bound, encode_data, encode_error,
@@ -31,13 +29,13 @@ use webview_sockets_proto::{
 
 use crate::{
     Limits, SessionEntry, TabId, Token, UdpHost, policy,
-    sock::{Sock, SockOptions},
+    sock::{self, Sock, SockOptions},
 };
 
 /// Received datagrams are batched into WebSocket messages of about this size.
 const BATCH_LEN: usize = 64 * 1024;
 
-/// Receive buffers per recv call.
+/// Number of receive buffers per receive call.
 const RECV_SLOTS: usize = 4;
 
 /// WebSocket close code for protocol errors.
@@ -52,10 +50,12 @@ const NAME_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Maximum number of cached host names per socket.
 const NAME_CACHE_LEN: usize = 64;
 
+/// Returns the router with the WebSocket route on [`WS_PATH`].
 pub(crate) fn router(host: UdpHost) -> Router {
     Router::new().route(WS_PATH, get(upgrade)).with_state(host)
 }
 
+/// Checks the upgrade request and starts a session on the WebSocket.
 async fn upgrade(
     State(host): State<UdpHost>,
     headers: HeaderMap,
@@ -64,10 +64,10 @@ async fn upgrade(
     if !host.enabled() {
         return (StatusCode::FORBIDDEN, "UDP is turned off").into_response();
     }
-    let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let header_value = |name| headers.get(name).and_then(|value| value.to_str().ok());
     let origin = match policy::check_upgrade(
-        get(header::HOST),
-        get(header::ORIGIN),
+        header_value(header::HOST),
+        header_value(header::ORIGIN),
         &host.inner.config.host_policy,
     ) {
         Ok(origin) => origin.to_string(),
@@ -76,11 +76,11 @@ async fn upgrade(
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
     };
-    let max = host.inner.config.limits.max_message_len;
-    ws.max_message_size(max)
-        .max_frame_size(max)
+    let max_len = host.inner.config.limits.max_message_len;
+    ws.max_message_size(max_len)
+        .max_frame_size(max_len)
         .on_upgrade(move |ws| {
-            let span = info_span!("udp", %origin, tab = tracing::field::Empty);
+            let span = info_span!("udp", %origin, tab = field::Empty);
             run(host, origin, ws).instrument(span)
         })
 }
@@ -108,6 +108,7 @@ impl Reject {
     }
 }
 
+/// Runs one WebSocket connection from HELLO to close.
 async fn run(host: UdpHost, origin: String, mut ws: WebSocket) {
     let session = match setup(&host, &origin, &mut ws).await {
         Ok(session) => session,
@@ -124,6 +125,7 @@ async fn run(host: UdpHost, origin: String, mut ws: WebSocket) {
     }
 }
 
+/// A session after a successful HELLO, with its bound socket.
 struct Session {
     guard: SessionGuard,
     close_rx: oneshot::Receiver<u16>,
@@ -132,6 +134,7 @@ struct Session {
     remote: Option<SocketAddr>,
 }
 
+/// Reads HELLO, registers the session, binds the socket and sends BOUND.
 async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Session, Reject> {
     let limits = &host.inner.config.limits;
     let msg = match tokio::time::timeout(limits.hello_timeout, ws.recv()).await {
@@ -145,23 +148,23 @@ async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Sessi
         Err(err) => return Err(Reject::new(ErrorCode::InvalidInput, err.to_string())),
     };
     let (guard, close_rx) = host.register(&hello.token, origin)?;
-    let span = tracing::Span::current();
-    span.record("tab", guard.tab.0);
-    let mut opts = SockOptions {
+    Span::current().record("tab", guard.tab.0);
+    let mut options = SockOptions {
         ipv6_only: None,
         send_buffer: buffer_size(hello.send_buffer_size, limits),
         recv_buffer: buffer_size(hello.receive_buffer_size, limits),
     };
     let (bind_addr, remote) = match hello.mode {
         Mode::Bound { local, ipv6_only } => {
-            policy::check_bind(local).map_err(|m| Reject::new(ErrorCode::InvalidInput, m))?;
-            if ipv6_only.is_some() && local.ip() != IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) {
+            policy::check_bind(local)
+                .map_err(|reason| Reject::new(ErrorCode::InvalidInput, reason))?;
+            if ipv6_only.is_some() && local.ip() != IpAddr::V6(Ipv6Addr::UNSPECIFIED) {
                 return Err(Reject::new(
                     ErrorCode::InvalidInput,
                     "ipv6Only needs the local address ::",
                 ));
             }
-            opts.ipv6_only = ipv6_only;
+            options.ipv6_only = ipv6_only;
             (local, None)
         }
         Mode::Connected {
@@ -171,7 +174,7 @@ async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Sessi
         } => {
             let remote = resolve(remote_host, remote_port, dns_query_type, limits).await?;
             let remote = policy::check_destination(remote)
-                .map_err(|m| Reject::new(ErrorCode::InvalidInput, m))?;
+                .map_err(|reason| Reject::new(ErrorCode::InvalidInput, reason))?;
             let any = match remote {
                 SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
                 SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
@@ -179,7 +182,7 @@ async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Sessi
             (any, Some(remote))
         }
     };
-    let sock = Sock::bind(bind_addr, &opts).map_err(|err| {
+    let sock = Sock::bind(bind_addr, &options).map_err(|err| {
         let code = match err.kind() {
             io::ErrorKind::AddrInUse => ErrorCode::AddrInUse,
             io::ErrorKind::AddrNotAvailable | io::ErrorKind::InvalidInput => {
@@ -194,7 +197,7 @@ async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Sessi
         .map_err(|err| Reject::new(ErrorCode::Io, err.to_string()))?;
     if let Some(remote) = remote {
         // Report the address the peer sees, like a connected socket would.
-        match crate::sock::route_local_ip(remote) {
+        match sock::route_local_ip(remote) {
             Ok(ip) => local.set_ip(ip),
             Err(err) => {
                 return Err(Reject::new(
@@ -204,7 +207,7 @@ async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Sessi
             }
         }
     }
-    let interface_addrs = tokio::task::spawn_blocking(move || crate::sock::interface_addrs(local))
+    let interface_addrs = tokio::task::spawn_blocking(move || sock::interface_addrs(local))
         .await
         .unwrap_or_default();
     let bound = Bound {
@@ -232,7 +235,7 @@ async fn setup(host: &UdpHost, origin: &str, ws: &mut WebSocket) -> Result<Sessi
 fn buffer_size(requested: u32, limits: &Limits) -> usize {
     match requested {
         0 => limits.max_socket_buffer,
-        n => (n as usize).min(limits.max_socket_buffer),
+        size => (size as usize).min(limits.max_socket_buffer),
     }
 }
 
@@ -249,7 +252,7 @@ pub(crate) async fn resolve(
 ) -> Result<SocketAddr, Reject> {
     let literal = host
         .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
+        .and_then(|inner| inner.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = literal.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
@@ -277,11 +280,11 @@ pub(crate) async fn resolve(
         }
     };
     let found = addrs
-        .map(|a| SocketAddr::new(a.ip().to_canonical(), a.port()))
-        .find(|a| dns.is_none_or(|d| d.matches(&a.ip())));
+        .map(canonical)
+        .find(|addr| dns.is_none_or(|dns| dns.matches(&addr.ip())));
     trace!(%host, ?dns, ?found, "resolved");
     found.ok_or_else(|| {
-        let family = dns.map_or("", |d| d.name());
+        let family = dns.map_or("", DnsQueryType::name);
         Reject::new(
             ErrorCode::NameNotResolved,
             format!("no {family} address for {host}"),
@@ -289,8 +292,10 @@ pub(crate) async fn resolve(
     })
 }
 
-/// Returns whether `host` looks like a DNS name: labels of letters, digits,
-/// `-` and `_`, at most 253 bytes.
+/// Returns whether `host` looks like a DNS name.
+///
+/// A DNS name has labels of letters, digits, `-` and `_`, and at most 253
+/// bytes.
 fn is_host_name(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     !host.is_empty()
@@ -300,12 +305,13 @@ fn is_host_name(host: &str) -> bool {
                 && label.len() <= 63
                 && label
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         })
 }
 
-/// Runs a bound session. Returns the close code to send, or `None` if the
-/// WebSocket is already gone.
+/// Runs a bound session and returns the close code to send.
+///
+/// Returns `None` if the WebSocket is already closed.
 async fn serve(host: &UdpHost, session: Session, ws: &mut WebSocket) -> Option<u16> {
     let Session {
         guard,
@@ -314,8 +320,9 @@ async fn serve(host: &UdpHost, session: Session, ws: &mut WebSocket) -> Option<u
         remote,
     } = session;
     let limits = &host.inner.config.limits;
-    let (tx, mut rx) = mpsc::channel(limits.recv_queue_len);
-    let mut recv_task = AbortOnDrop(tokio::spawn(recv_loop(sock.clone(), remote, tx)));
+    let (frame_tx, mut frame_rx) = mpsc::channel(limits.recv_queue_len);
+    let mut recv_task =
+        AbortOnDropHandle::new(tokio::spawn(recv_loop(sock.clone(), remote, frame_tx)));
     // Names resolve to the socket's family unless the page asks otherwise.
     let default_dns = match sock.local_addr() {
         Ok(SocketAddr::V4(_)) => Some(DnsQueryType::Ipv4),
@@ -329,42 +336,55 @@ async fn serve(host: &UdpHost, session: Session, ws: &mut WebSocket) -> Option<u
         names: HashMap::new(),
     };
     let code = loop {
-        tokio::select! {
-            code = &mut close_rx => break code.unwrap_or(close_code::NORMAL),
-            frame = rx.recv() => match frame {
-                Some(frame) => {
-                    if ws.send(Message::Binary(frame.into())).await.is_err() {
-                        return None;
-                    }
-                }
-                None => {
-                    let res = (&mut recv_task.0).await;
-                    warn!(?res, "udp receive failed");
-                    break close_code::IO_ERROR;
-                }
-            },
-            msg = ws.recv() => match msg {
-                Some(Ok(Message::Binary(msg))) => {
-                    if let Err(code) = sender.handle(ws, &msg).await {
-                        break code;
-                    }
-                }
-                Some(Ok(Message::Text(_))) => break CLOSE_UNSUPPORTED,
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) => {
-                    // Reading on flushes the queued close reply.
-                    drop(guard);
-                    let drain = async { while let Some(Ok(_)) = ws.recv().await {} };
-                    tokio::time::timeout(Duration::from_secs(1), drain).await.ok();
+        let event = tokio::select! {
+            code = &mut close_rx => Event::Close(code.unwrap_or(close_code::NORMAL)),
+            frame = frame_rx.recv() => Event::Frame(frame),
+            message = ws.recv() => Event::Message(message),
+        };
+        match event {
+            Event::Close(code) => break code,
+            Event::Frame(Some(frame)) => {
+                if ws.send(Message::Binary(frame.into())).await.is_err() {
                     return None;
                 }
-                Some(Err(_)) | None => return None,
-            },
+            }
+            Event::Frame(None) => {
+                let result = (&mut recv_task).await;
+                warn!(?result, "udp receive failed");
+                break close_code::IO_ERROR;
+            }
+            Event::Message(Some(Ok(Message::Binary(message)))) => {
+                if let Err(code) = sender.handle(ws, &message).await {
+                    break code;
+                }
+            }
+            Event::Message(Some(Ok(Message::Text(_)))) => break CLOSE_UNSUPPORTED,
+            Event::Message(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Event::Message(Some(Ok(Message::Close(_)))) => {
+                // Reading on flushes the queued close reply.
+                drop(guard);
+                let drain = async { while let Some(Ok(_)) = ws.recv().await {} };
+                tokio::time::timeout(Duration::from_secs(1), drain)
+                    .await
+                    .ok();
+                return None;
+            }
+            Event::Message(Some(Err(_)) | None) => return None,
         }
     };
     debug!(code, "closing udp session");
     drop(guard);
     Some(code)
+}
+
+/// What woke up the loop in [`serve`].
+enum Event {
+    /// The host closes the session with this code.
+    Close(u16),
+    /// A message of received datagrams, or `None` if the receive task ended.
+    Frame(Option<Vec<u8>>),
+    /// A message from the page, or `None` if the WebSocket closed.
+    Message(Option<Result<Message, axum::Error>>),
 }
 
 /// Sends the datagrams of page messages.
@@ -380,21 +400,24 @@ struct Sender<'a> {
 }
 
 impl Sender<'_> {
-    /// Sends the records of one page message. Returns a close code on a
-    /// protocol error or a dead WebSocket.
+    /// Sends the records of one page message.
     ///
     /// Name lookups for DATA_NAMED records run inline, so a slow resolver
     /// delays the following datagrams of this socket.
-    async fn handle(&mut self, ws: &mut WebSocket, msg: &[u8]) -> Result<(), u16> {
-        let records = decode_records(msg).map_err(|_| CLOSE_PROTOCOL)?;
-        for rec in records {
-            let rec = rec.map_err(|err| {
+    ///
+    /// # Errors
+    ///
+    /// Returns the close code on a protocol error or a closed WebSocket.
+    async fn handle(&mut self, ws: &mut WebSocket, message: &[u8]) -> Result<(), u16> {
+        let records = decode_records(message).map_err(|_| CLOSE_PROTOCOL)?;
+        for record in records {
+            let record = record.map_err(|err| {
                 debug!(%err, "bad data record");
                 CLOSE_PROTOCOL
             })?;
-            let (dest, ecn, segment_size, payload) = match rec {
-                Record::Data(d) => (d.peer, d.ecn, d.segment_size, d.payload),
-                Record::Named(n) => {
+            let (dest, ecn, segment_size, payload) = match record {
+                Record::Data(data) => (data.peer, data.ecn, data.segment_size, data.payload),
+                Record::Named(named) => {
                     if self.remote.is_some() {
                         send_error(
                             ws,
@@ -404,8 +427,11 @@ impl Sender<'_> {
                         .await?;
                         continue;
                     }
-                    match self.lookup(n.host, n.port, n.dns_query_type).await {
-                        Ok(dest) => (dest, n.ecn, n.segment_size, n.payload),
+                    match self
+                        .lookup(named.host, named.port, named.dns_query_type)
+                        .await
+                    {
+                        Ok(dest) => (dest, named.ecn, named.segment_size, named.payload),
                         Err(reject) => {
                             send_error(ws, reject.code, &reject.message).await?;
                             continue;
@@ -454,15 +480,15 @@ impl Sender<'_> {
     ) -> Result<SocketAddr, Reject> {
         let dns = dns.or(self.default_dns);
         let key = (host.to_string(), dns);
-        if let Some((ip, at)) = self.names.get(&key)
-            && at.elapsed() < NAME_CACHE_TTL
+        if let Some((ip, resolved_at)) = self.names.get(&key)
+            && resolved_at.elapsed() < NAME_CACHE_TTL
         {
             return Ok(SocketAddr::new(*ip, port));
         }
         let addr = resolve(host, port, dns, self.limits).await?;
         if self.names.len() >= NAME_CACHE_LEN {
             self.names
-                .retain(|_, (_, at)| at.elapsed() < NAME_CACHE_TTL);
+                .retain(|_, (_, resolved_at)| resolved_at.elapsed() < NAME_CACHE_TTL);
             if self.names.len() >= NAME_CACHE_LEN {
                 self.names.clear();
             }
@@ -477,13 +503,15 @@ const EMSGSIZE: i32 = libc::EMSGSIZE;
 #[cfg(windows)]
 const EMSGSIZE: i32 = 10040; // WSAEMSGSIZE
 
-/// Reads datagrams and queues them as WebSocket messages of up to
-/// [`BATCH_LEN`] bytes. Drops messages when the queue is full, and in
-/// connected mode datagrams from other peers than `remote`.
+/// Reads datagrams and queues them as WebSocket messages.
+///
+/// A message holds up to [`BATCH_LEN`] bytes. Drops messages when the queue
+/// is full, and in connected mode drops datagrams from peers other than
+/// `remote`.
 async fn recv_loop(
     sock: Arc<Sock>,
     remote: Option<SocketAddr>,
-    tx: mpsc::Sender<Vec<u8>>,
+    frame_tx: mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
     let slot_len = (sock.gro_segments() * 1500).max(u16::MAX as usize);
     let mut buf = vec![0u8; slot_len * RECV_SLOTS];
@@ -491,7 +519,7 @@ async fn recv_loop(
     let mut frame = Vec::new();
     let mut dropped = 0u64;
     let mut push = |frame: &mut Vec<u8>| -> bool {
-        match tx.try_send(std::mem::take(frame)) {
+        match frame_tx.try_send(std::mem::take(frame)) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 dropped += 1;
@@ -506,42 +534,42 @@ async fn recv_loop(
     loop {
         sock.readable().await?;
         loop {
-            let res = {
+            let result = {
                 let mut slices: Vec<IoSliceMut<'_>> =
                     buf.chunks_mut(slot_len).map(IoSliceMut::new).collect();
                 sock.try_recv(&mut slices, &mut meta)
             };
-            let n = match res {
-                Ok(n) => n,
+            let count = match result {
+                Ok(count) => count,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) if is_transient(&err) => continue,
                 Err(err) => return Err(err),
             };
-            for (i, m) in meta.iter().take(n).enumerate() {
-                let peer = canonical(m.addr);
-                if remote.is_some_and(|r| r != peer) {
+            for (slot, slot_meta) in meta.iter().take(count).enumerate() {
+                let peer = canonical(slot_meta.addr);
+                if remote.is_some_and(|remote| remote != peer) {
                     trace!(%peer, "dropping datagram from other than the connected peer");
                     continue;
                 }
-                let payload = &buf[i * slot_len..][..m.len];
-                let segment_size = if m.stride < m.len {
-                    u16::try_from(m.stride).unwrap_or(0)
+                let payload = &buf[slot * slot_len..][..slot_meta.len];
+                let segment_size = if slot_meta.stride < slot_meta.len {
+                    u16::try_from(slot_meta.stride).unwrap_or(0)
                 } else {
                     0
                 };
-                let rec = Data {
-                    ecn: m.ecn.map(|e| e as u8).unwrap_or(0),
+                let record = Data {
+                    ecn: slot_meta.ecn.map_or(0, |ecn| ecn as u8),
                     peer,
                     segment_size,
                     payload,
                 };
                 if !frame.is_empty()
-                    && frame.len() + rec.encoded_len() > BATCH_LEN
+                    && frame.len() + record.encoded_len() > BATCH_LEN
                     && !push(&mut frame)
                 {
                     return Ok(());
                 }
-                encode_data(&rec, &mut frame);
+                encode_data(&record, &mut frame);
             }
         }
         if !frame.is_empty() && !push(&mut frame) {
@@ -550,8 +578,9 @@ async fn recv_loop(
     }
 }
 
-/// Errors on an unconnected UDP socket that do not end the session (ICMP
-/// feedback on some platforms).
+/// Returns whether an error on a UDP socket leaves the session open.
+///
+/// Some platforms report ICMP feedback as these errors.
 fn is_transient(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -563,10 +592,12 @@ fn is_transient(err: &io::Error) -> bool {
     )
 }
 
+/// Returns `addr` with an IPv4-mapped IPv6 address turned into IPv4.
 fn canonical(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Sends an ERROR frame, or returns a close code if the WebSocket failed.
 async fn send_error(ws: &mut WebSocket, code: ErrorCode, message: &str) -> Result<(), u16> {
     let mut out = Vec::new();
     encode_error(&ErrorFrame { code, message }, &mut out);
@@ -575,6 +606,7 @@ async fn send_error(ws: &mut WebSocket, code: ErrorCode, message: &str) -> Resul
         .map_err(|_| close_code::NORMAL)
 }
 
+/// Sends a close frame with `code` and a short reason.
 async fn close(mut ws: WebSocket, code: u16) {
     let reason = match code {
         close_code::REVOKED => "revoked",
@@ -592,14 +624,6 @@ async fn close(mut ws: WebSocket, code: u16) {
     })))
     .await
     .ok();
-}
-
-struct AbortOnDrop<T>(JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// Removes the session from the host when dropped.
@@ -643,7 +667,11 @@ impl UdpHost {
             ));
         }
         let tab = ticket.tab;
-        let per_tab = state.sessions.values().filter(|s| s.tab == tab).count();
+        let per_tab = state
+            .sessions
+            .values()
+            .filter(|session| session.tab == tab)
+            .count();
         if per_tab >= limits.max_sockets_per_tab {
             return Err(Reject::new(
                 ErrorCode::Limit,
@@ -653,7 +681,7 @@ impl UdpHost {
         let per_origin = state
             .sessions
             .values()
-            .filter(|s| s.origin == origin)
+            .filter(|session| session.origin == origin)
             .count();
         if per_origin >= limits.max_sockets_per_origin {
             return Err(Reject::new(

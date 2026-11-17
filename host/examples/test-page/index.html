@@ -18,26 +18,26 @@ fails with NotAllowedError (run the test-host without
 <pre id="log"></pre>
 <script>
 (async () => {
-  const log = (...a) => {
-    const line = a.join(" ");
+  const log = (...parts) => {
+    const line = parts.join(" ");
     document.getElementById("log").textContent += line + "\n";
     console.log(line);
   };
   const done = (ok, detail) => {
-    const t = `UDP-TEST ${ok ? "PASS" : "FAIL"} ${detail}`;
-    document.title = t;
-    log(t);
+    const title = `UDP-TEST ${ok ? "PASS" : "FAIL"} ${detail}`;
+    document.title = title;
+    log(title);
   };
-  const assert = (cond, what) => {
-    if (!cond) throw new Error(`check failed: ${what}`);
+  const assert = (condition, what) => {
+    if (!condition) throw new Error(`check failed: ${what}`);
   };
-  const withTimeout = (p, ms, what) => Promise.race([
-    p, new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout: ${what}`)), ms)),
+  const withTimeout = (promise, ms, what) => Promise.race([
+    promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout: ${what}`)), ms)),
   ]);
-  // Expects promise `p` to reject with a DOMException or TypeError named `name`.
-  const rejects = async (p, name, what) => {
+  // Expects `promise` to reject with a DOMException or TypeError named `name`.
+  const rejects = async (promise, name, what) => {
     try {
-      await withTimeout(p, 5000, what);
+      await withTimeout(promise, 5000, what);
     } catch (err) {
       if (err.name !== name) throw new Error(`${what}: expected ${name}, got ${err.name}: ${err.message}`);
       log(`${what}: ${name} ok (${err.message})`);
@@ -45,8 +45,8 @@ fails with NotAllowedError (run the test-host without
     }
     throw new Error(`${what}: expected ${name}, but it succeeded`);
   };
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
   const params = new URLSearchParams(location.search);
 
   // Opens a socket and returns { sock, info, reader, writer }.
@@ -55,16 +55,16 @@ fails with NotAllowedError (run the test-host without
     const info = await withTimeout(sock.opened, 5000, `open ${JSON.stringify(opts)}`);
     return { sock, info, reader: info.readable.getReader(), writer: info.writable.getWriter() };
   };
-  const read = (s, what) => withTimeout(s.reader.read().then((r) => r.value), 3000, what);
+  const read = (socket, what) => withTimeout(socket.reader.read().then((result) => result.value), 3000, what);
 
   try {
     if (!window.webviewSockets) {
       await new Promise((resolve, reject) => {
-        const s = document.createElement("script");
-        s.src = "/.well-known/webview-sockets/polyfill.js";
-        s.onload = resolve;
-        s.onerror = () => reject(new Error("could not load the polyfill script"));
-        document.head.appendChild(s);
+        const script = document.createElement("script");
+        script.src = "/.well-known/webview-sockets/polyfill.js";
+        script.onload = resolve;
+        script.onerror = () => reject(new Error("could not load the polyfill script"));
+        document.head.appendChild(script);
       });
     }
     if (typeof UDPSocket !== "function") throw new Error("UDPSocket missing (not served by a webview-sockets host?)");
@@ -79,11 +79,11 @@ fails with NotAllowedError (run the test-host without
     }
 
     // ---- webviewSockets.udp (fast API) ----
-    const collect = (sock, n) => new Promise((resolve) => {
+    const collect = (sock, count) => new Promise((resolve) => {
       const got = [];
-      sock.onmessage = (m) => {
-        got.push({ ...m, data: m.data.slice() });
-        if (got.length === n) resolve(got);
+      sock.onmessage = (message) => {
+        got.push({ ...message, data: message.data.slice() });
+        if (got.length === count) resolve(got);
       };
     });
     {
@@ -93,19 +93,19 @@ fails with NotAllowedError (run the test-host without
       let p = collect(fb, 1);
       fa.send("hello", "127.0.0.1", fb.localPort);
       let got = await withTimeout(p, 3000, "fast single");
-      assert(dec.decode(got[0].data) === "hello" && got[0].port === fa.localPort, "fast single datagram");
+      assert(decoder.decode(got[0].data) === "hello" && got[0].port === fa.localPort, "fast single datagram");
       p = collect(fb, 5);
       fa.send(new Uint8Array(440), "127.0.0.1", fb.localPort, { segmentSize: 100 });
       got = await withTimeout(p, 3000, "fast gso");
       assert(got.map((m) => m.data.length).join(",") === "100,100,100,100,40", "fast gso sizes");
       p = collect(fa, 100);
-      for (let i = 0; i < 100; i++) fb.send(enc.encode(`m${i}`), "127.0.0.1", fa.localPort);
+      for (let i = 0; i < 100; i++) fb.send(encoder.encode(`m${i}`), "127.0.0.1", fa.localPort);
       got = await withTimeout(p, 3000, "fast 100");
-      assert(new Set(got.map((m) => dec.decode(m.data))).size === 100, "fast 100 distinct");
+      assert(new Set(got.map((m) => decoder.decode(m.data))).size === 100, "fast 100 distinct");
       p = collect(fb, 1);
       fa.send("named", "localhost", fb.localPort, { dnsQueryType: "ipv4" });
       got = await withTimeout(p, 3000, "fast named");
-      assert(dec.decode(got[0].data) === "named", "fast send to host name");
+      assert(decoder.decode(got[0].data) === "named", "fast send to host name");
       const ferr = new Promise((resolve) => { fa.onerror = resolve; });
       fa.send("x", "224.0.0.1", 9);
       const fe = await withTimeout(ferr, 3000, "fast onerror");
@@ -115,11 +115,11 @@ fails with NotAllowedError (run the test-host without
       p = collect(fb, 1);
       fc.send("from fc");
       got = await withTimeout(p, 3000, "fast connected send");
-      assert(dec.decode(got[0].data) === "from fc", "fast connected payload");
+      assert(decoder.decode(got[0].data) === "from fc", "fast connected payload");
       p = collect(fc, 1);
       fb.send("to fc", got[0].address, got[0].port);
       got = await withTimeout(p, 3000, "fast connected recv");
-      assert(dec.decode(got[0].data) === "to fc", "fast connected receive");
+      assert(decoder.decode(got[0].data) === "to fc", "fast connected receive");
       let bindErr = null;
       try { await webviewSockets.udp.bind({ localAddress: "127.0.0.1", localPort: fb.localPort }); } catch (e) { bindErr = e.name; }
       assert(bindErr === "NetworkError", `fast bind in use: ${bindErr}`);
@@ -151,18 +151,18 @@ fails with NotAllowedError (run the test-host without
     const bPort = b.info.localPort;
 
     // Single datagram, bound to bound.
-    await a.writer.write({ data: enc.encode("hello"), remoteAddress: "127.0.0.1", remotePort: bPort });
+    await a.writer.write({ data: encoder.encode("hello"), remoteAddress: "127.0.0.1", remotePort: bPort });
     let m = await read(b, "single datagram");
-    assert(dec.decode(m.data) === "hello", "payload");
+    assert(decoder.decode(m.data) === "hello", "payload");
     assert(m.data instanceof Uint8Array, "data is a Uint8Array");
     assert(m.remotePort === a.info.localPort && m.remoteAddress === "127.0.0.1", `source ${m.remoteAddress}:${m.remotePort}`);
     log("single datagram ok");
 
     // ArrayBuffer data and a DataView.
-    a.writer.write({ data: enc.encode("ab").buffer, remoteAddress: "127.0.0.1", remotePort: bPort });
-    a.writer.write({ data: new DataView(enc.encode("xdvx").buffer, 1, 2), remoteAddress: "127.0.0.1", remotePort: bPort });
-    assert(dec.decode((await read(b, "ArrayBuffer")).data) === "ab", "ArrayBuffer payload");
-    assert(dec.decode((await read(b, "DataView")).data) === "dv", "DataView payload");
+    a.writer.write({ data: encoder.encode("ab").buffer, remoteAddress: "127.0.0.1", remotePort: bPort });
+    a.writer.write({ data: new DataView(encoder.encode("xdvx").buffer, 1, 2), remoteAddress: "127.0.0.1", remotePort: bPort });
+    assert(decoder.decode((await read(b, "ArrayBuffer")).data) === "ab", "ArrayBuffer payload");
+    assert(decoder.decode((await read(b, "DataView")).data) === "dv", "DataView payload");
 
     // GSO (non-standard): 5 segments of 100 bytes, the last 40.
     const batch = new Uint8Array(440).map((_, i) => i & 0xff);
@@ -190,38 +190,38 @@ fails with NotAllowedError (run the test-host without
     await g.sock.close();
 
     // Many writes in one tick.
-    for (let i = 0; i < 100; i++) b.writer.write({ data: enc.encode(`m${i}`), remoteAddress: "127.0.0.1", remotePort: a.info.localPort });
+    for (let i = 0; i < 100; i++) b.writer.write({ data: encoder.encode(`m${i}`), remoteAddress: "127.0.0.1", remotePort: a.info.localPort });
     const seen = new Set();
-    for (let i = 0; i < 100; i++) seen.add(dec.decode((await read(a, "100 datagrams")).data));
+    for (let i = 0; i < 100; i++) seen.add(decoder.decode((await read(a, "100 datagrams")).data));
     log(`100 datagrams ok (${seen.size} distinct)`);
 
     // Bound mode send to a host name.
-    await a.writer.write({ data: enc.encode("named"), remoteAddress: "localhost", remotePort: bPort, dnsQueryType: "ipv4" });
+    await a.writer.write({ data: encoder.encode("named"), remoteAddress: "localhost", remotePort: bPort, dnsQueryType: "ipv4" });
     m = await read(b, "send to host name");
-    assert(dec.decode(m.data) === "named", "named payload");
+    assert(decoder.decode(m.data) === "named", "named payload");
     log("send to host name ok");
 
     // Host-side send error (non-standard onsenderror), the socket stays usable.
     const sendErr = new Promise((resolve) => { a.sock.onsenderror = resolve; });
-    await a.writer.write({ data: enc.encode("x"), remoteAddress: "no-such-host.invalid", remotePort: 9 });
+    await a.writer.write({ data: encoder.encode("x"), remoteAddress: "no-such-host.invalid", remotePort: 9 });
     const se = await withTimeout(sendErr, 12000, "onsenderror");
     log(`onsenderror: ${se.name}: ${se.message}`);
-    await a.writer.write({ data: enc.encode("still"), remoteAddress: "127.0.0.1", remotePort: bPort });
-    assert(dec.decode((await read(b, "after send error")).data) === "still", "socket usable after send error");
+    await a.writer.write({ data: encoder.encode("still"), remoteAddress: "127.0.0.1", remotePort: bPort });
+    assert(decoder.decode((await read(b, "after send error")).data) === "still", "socket usable after send error");
 
     // Connected mode by host name.
     const c = await open({ remoteAddress: "localhost", remotePort: bPort, dnsQueryType: "ipv4" });
     log(`c: ${c.info.localAddress}:${c.info.localPort} -> ${c.info.remoteAddress}:${c.info.remotePort}`);
     assert(c.info.remoteAddress === "127.0.0.1" && c.info.remotePort === bPort, "connected open info");
-    await c.writer.write({ data: enc.encode("from c") });
+    await c.writer.write({ data: encoder.encode("from c") });
     m = await read(b, "connected send");
-    assert(dec.decode(m.data) === "from c", "connected payload");
-    await b.writer.write({ data: enc.encode("to c"), remoteAddress: m.remoteAddress, remotePort: m.remotePort });
+    assert(decoder.decode(m.data) === "from c", "connected payload");
+    await b.writer.write({ data: encoder.encode("to c"), remoteAddress: m.remoteAddress, remotePort: m.remotePort });
     m = await read(c, "connected receive");
-    assert(dec.decode(m.data) === "to c", "connected receive payload");
+    assert(decoder.decode(m.data) === "to c", "connected receive payload");
     assert(m.remoteAddress === undefined && m.remotePort === undefined, "connected messages carry only data");
     log("connected mode ok");
-    await rejects(c.writer.write({ data: enc.encode("x"), remoteAddress: "127.0.0.1", remotePort: bPort }),
+    await rejects(c.writer.write({ data: encoder.encode("x"), remoteAddress: "127.0.0.1", remotePort: bPort }),
       "TypeError", "connected write with remoteAddress");
     await rejects(c.sock.close(), "InvalidStateError", "close() with locked streams");
     c.reader.releaseLock();
@@ -230,9 +230,9 @@ fails with NotAllowedError (run the test-host without
 
     // Bound mode write errors.
     const d = await open({ localAddress: "127.0.0.1" });
-    await rejects(d.writer.write({ data: enc.encode("x") }), "TypeError", "bound write without remoteAddress");
+    await rejects(d.writer.write({ data: encoder.encode("x") }), "TypeError", "bound write without remoteAddress");
     const e = await open({ localAddress: "127.0.0.1" });
-    await rejects(e.writer.write({ data: enc.encode("x"), remoteAddress: "224.0.0.1", remotePort: 9 }),
+    await rejects(e.writer.write({ data: encoder.encode("x"), remoteAddress: "224.0.0.1", remotePort: 9 }),
       "NotAllowedError", "multicast write");
     const f = await open({ localAddress: "127.0.0.1" });
     await rejects(f.writer.write({ data: "text", remoteAddress: "127.0.0.1", remotePort: bPort }),
@@ -246,8 +246,8 @@ fails with NotAllowedError (run the test-host without
     const params2 = params.get("peer");
     if (params2) {
       const mm = /^(.*):(\d+)$/.exec(params2);
-      await a.writer.write({ data: enc.encode(params.get("send") || "hello"), remoteAddress: mm[1].replace(/^\[|\]$/g, ""), remotePort: Number(mm[2]) });
-      const text = dec.decode((await read(a, "echo")).data);
+      await a.writer.write({ data: encoder.encode(params.get("send") || "hello"), remoteAddress: mm[1].replace(/^\[|\]$/g, ""), remotePort: Number(mm[2]) });
+      const text = decoder.decode((await read(a, "echo")).data);
       if (params.get("expect") && text !== params.get("expect")) throw new Error(`echo got ${text}`);
       log(`echo ok: ${text}`);
     }
