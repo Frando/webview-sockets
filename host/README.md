@@ -1,29 +1,23 @@
 # webview-sockets-host
 
-The app side of webview-sockets. It gives pages in your webview UDP sockets
-(`webviewSockets.udp`, plus a Direct Sockets `UDPSocket` layer), backed by
-real sockets in your app. See the
-[project README](../README.md) for the design and the security model.
+The app side of webview-sockets: gives pages in your webview UDP sockets
+backed by real sockets in your app. See the [project README](../README.md)
+for the page API and the security model.
 
-The crate provides:
+- `UdpHost`: sessions, per-origin grants (persisted to a JSON file),
+  "allow once" grants per tab, limits, and an active-tabs watch for a
+  "using sockets" indicator.
+- `UdpHost::router()`: the axum route on `/.well-known/webview-sockets/udp`,
+  to merge into the server that serves your pages.
+- `UdpHost::injected_js()`: the script to inject at document start, gated
+  to the policy's hosts (`INJECTED_JS` is ungated). Source:
+  [`js/webview-sockets.js`](js/webview-sockets.js) plus the codec from
+  `webview-sockets-proto`.
+- `BridgeRequest`, `bridge_reply`, `reply_script`: the bridge messages.
 
-- `UdpHost`: sessions, per-origin grants (persisted to a JSON file), "allow
-  once" grants per tab, limits, and the active-tabs watch for a "using
-  sockets" indicator.
-- `UdpHost::router()`: the axum route on
-  `/.well-known/webview-sockets/udp`, to merge into the server that serves
-  your pages.
-- `UdpHost::injected_js()`: the script to inject at document start. With
-  `HostPolicy::patterns` it only runs on matching hosts. `INJECTED_JS` is
-  the ungated version, and `injected_js_for(patterns)` gates by explicit
-  patterns. The source is [`js/webview-sockets.js`](js/webview-sockets.js)
-  plus the codec from `webview-sockets-proto`.
-- `BridgeRequest`, `bridge_reply` and `reply_script`: the JSON messages on
-  the platform bridge.
-
-The app provides the HTTP server, the bridge (an Android web message
-listener named `webviewSocketsBridge`, or wry's `window.ipc`), the
-permission prompt, and the tab lifecycle calls.
+The app provides the HTTP server, the bridge, the permission prompt, and
+the tab lifecycle calls (`tab_navigated` when the main frame navigates,
+`tab_closed`).
 
 ## Usage
 
@@ -32,7 +26,6 @@ use webview_sockets_host::{
     BridgeRequest, Choice, Decision, HostPolicy, TabId, UdpHost, UdpHostConfig, bridge_reply,
 };
 
-// Pages on http://<name>.app.localhost:8080 may ask for sockets.
 let host = UdpHost::new(UdpHostConfig::new(
     data_dir.join("socket-grants.json"),
     HostPolicy::patterns(["*.app.localhost:8080"]),
@@ -41,81 +34,58 @@ host.set_enabled(true);
 let router = axum::Router::new().merge(host.router()); // plus your pages
 let script = host.injected_js(); // inject at document start
 
-// A bridge message from a page.  comes from the platform.
+// A bridge message from a page. `origin` must come from the platform.
 fn on_bridge(host: &UdpHost, origin: &str, tab: TabId, json: &str) -> Option<String> {
     let req = BridgeRequest::parse(json)?;
     Some(match host.request(origin, tab) {
         Decision::Granted(ticket) => bridge_reply(req.id, Ok(&ticket)),
-        Decision::NeedPrompt => {
-            // Ask the user, then:
-            match host.answer(origin, tab, Choice::AllowOnce) {
-                Some(ticket) => bridge_reply(req.id, Ok(&ticket)),
-                None => bridge_reply(req.id, Err("NotAllowed")),
-            }
-        }
+        Decision::NeedPrompt => match host.answer(origin, tab, Choice::AllowOnce) {
+            // ask the user first
+            Some(ticket) => bridge_reply(req.id, Ok(&ticket)),
+            None => bridge_reply(req.id, Err("NotAllowed")),
+        },
         Decision::Denied => bridge_reply(req.id, Err("NotAllowed")),
         Decision::Disabled => bridge_reply(req.id, Err("Disabled")),
     })
 }
 ```
 
-Call `host.tab_navigated(tab)` when a tab's main frame navigates, and
-`host.tab_closed(tab)` when it closes. The project README has complete
-Android (androidx.webkit) and wry examples.
+`HostPolicy::patterns` takes host authorities where `*` matches one label
+or port (`*.localhost:*`). It is checked on the bridge origin and on the
+WebSocket `Host`, and `Origin` must match `Host`. `HostPolicy::from_fn`
+takes any rule; `HostPolicy::Any` is for dev tools.
 
-`HostPolicy` decides which page hosts may use sockets. The check runs on
-the bridge-reported origin and on the WebSocket's `Host`, and `Origin`
-must match `Host`. `HostPolicy::patterns` takes host authorities where
-`*` matches one label or port (`*.localhost:*`). `HostPolicy::from_fn`
-takes any rule, and `HostPolicy::Any` is for dev tools.
+### Platform bridges
 
-## The injected script
-
-In the top frame of http(s) pages on an allowed host, it defines:
-
-- `window.webviewSockets`, which has `{ version, udp: { bind, connect },
-  UDPSocket, requestSession() }`. `udp` is the primary, fast API: socket
-  objects with `send(data, address?, port?, opts)`, `onmessage`,
-  `onerror`, `onclose` and `close()`.
-- `window.UDPSocket`, a Direct Sockets compatibility layer built on `udp`.
-  It is installed only if the browser has none, and has about half the
-  throughput.
-
-The project README documents both APIs, the error names and the
-benchmarks.
+- **Android (androidx.webkit):** inject with `addDocumentStartJavaScript`
+  and register `addWebMessageListener` under the name
+  `webviewSocketsBridge`, both with the same origin rules as the policy.
+  Ignore messages where `isMainFrame` is false, take the origin from
+  `sourceOrigin` (trim the trailing `/`), and reply with `bridge_reply`.
+  Call `tab_navigated` from `WebViewClient.onPageStarted`.
+- **wry:** inject with `with_initialization_script`; in the IPC handler,
+  `BridgeRequest::parse` the body (other messages are the app's own), take
+  the origin from the request URI, and deliver the reply with
+  `webview.evaluate_script(&reply_script(&origin, id, &reply))`, which only
+  reaches the page if it is still on that origin.
 
 ## Testing pages without an app
 
-The `test-host` example serves a directory on `127.0.0.1` for
-`*.localhost:*` hosts. It serves the script at
-`/.well-known/webview-sockets/polyfill.js` with a dev bridge that grants
-sessions over HTTP. Pages load that script when `window.webviewSockets`
-is missing.
+The `test-host` example serves a directory for `*.localhost:*` hosts, with
+the script at `/.well-known/webview-sockets/polyfill.js` and a dev bridge
+over HTTP. Without `--auto-grant` every request is denied, to test the
+`NotAllowedError` paths.
 
 ```sh
 cargo run -p webview-sockets-host --example test-host -- --dir <dir> --auto-grant [--port N]
-# open http://test.localhost:<port>/
-```
-
-Without `--auto-grant` every request is denied, which tests the
-`NotAllowedError` paths. [`examples/test-page`](examples/test-page) is a
-self test of the API, and
-[`run-chrome.mjs`](examples/test-page/run-chrome.mjs) drives such pages in
-headless Chrome (`?denied=1` checks the denied path):
-
-```sh
 cargo test -p webview-sockets-host
 node host/js/polyfill.test.mjs
-node host/examples/test-page/run-chrome.mjs http://test.localhost:<port>/
+node host/examples/test-page/run-chrome.mjs http://test.localhost:<port>/   # ?denied=1 for the denied path
 ```
+
+[`examples/test-page`](examples/test-page) is a self test of both APIs.
 
 ## License
 
-This project is licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE) or
-  https://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](../LICENSE-MIT) or
-  https://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE)
+or [MIT license](../LICENSE-MIT), at your option.
