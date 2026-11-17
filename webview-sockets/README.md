@@ -16,7 +16,7 @@ and gets real UDP where the app provides it.
 
 ```toml
 [dependencies]
-webview-sockets = { git = "ssh://git@github.com/Frando/webview-sockets.git", branch = "main" }
+webview-sockets = { git = "https://github.com/Frando/webview-sockets", branch = "main" }
 ```
 
 ```sh
