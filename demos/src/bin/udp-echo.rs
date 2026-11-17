@@ -1,10 +1,11 @@
-//! Native UDP echo server and client for testing the webview-sockets UDP demo page.
+//! Native UDP echo server and client for the webview-sockets demo pages.
 //!
 //! `udp-echo listen [--port N]` binds a socket, prints its addresses and echoes
 //! every datagram back to its sender. `udp-echo send <addr> <text>` sends one
 //! datagram and prints the reply.
 
 use std::{
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
@@ -13,7 +14,7 @@ use clap::{Parser, Subcommand};
 use n0_error::{Result, StdResultExt, anyerr};
 use tokio::net::UdpSocket;
 
-/// Largest UDP payload we accept.
+/// Largest UDP payload the tool accepts.
 const MAX_DATAGRAM: usize = 65535;
 /// Datagrams printed in full before switching to periodic counts.
 const PRINT_FIRST: u64 = 20;
@@ -28,6 +29,7 @@ struct Cli {
     command: Command,
 }
 
+/// The subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Echo every received datagram back to its sender.
@@ -74,6 +76,7 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Echoes every datagram on `bind` back to its sender.
 async fn listen(bind: SocketAddr, prefix: Vec<u8>, verbose: bool) -> Result<()> {
     let sock = UdpSocket::bind(bind)
         .await
@@ -92,9 +95,9 @@ async fn listen(bind: SocketAddr, prefix: Vec<u8>, verbose: bool) -> Result<()> 
     let mut last_stats = Instant::now();
     loop {
         let (len, from) = match sock.recv_from(&mut buf).await {
-            Ok(r) => r,
-            // ICMP port unreachable from an earlier send shows up here on some platforms.
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            Ok(received) => received,
+            // Some platforms report ICMP port unreachable of an earlier send here.
+            Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
             Err(err) => return Err(err).std_context("recv"),
         };
         count += 1;
@@ -114,6 +117,7 @@ async fn listen(bind: SocketAddr, prefix: Vec<u8>, verbose: bool) -> Result<()> 
     }
 }
 
+/// Sends `text` to `addr` and prints the reply.
 async fn send(addr: &str, text: &str, timeout: Duration) -> Result<()> {
     let peer = tokio::net::lookup_host(addr)
         .await
@@ -142,23 +146,23 @@ async fn send(addr: &str, text: &str, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Local interface addresses usable with a socket bound to `local`, with its port.
+/// Returns the local interface addresses of a socket bound to `local`.
 fn interface_addrs(local: SocketAddr) -> Vec<SocketAddr> {
     if !local.ip().is_unspecified() {
         return vec![local];
     }
     let v6 = local.is_ipv6();
-    let ifaces = match if_addrs::get_if_addrs() {
-        Ok(ifaces) => ifaces,
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces,
         Err(err) => {
             eprintln!("listing interfaces: {err}");
             return Vec::new();
         }
     };
-    ifaces
+    interfaces
         .into_iter()
-        .map(|iface| iface.ip())
-        // A v6 socket on `::` is usually dual-stack; skip link-local v6 (needs a scope id).
+        .map(|interface| interface.ip())
+        // A socket on `::` is usually dual-stack. Link-local IPv6 needs a scope id, so skip it.
         .filter(|ip| match ip {
             IpAddr::V4(_) => true,
             IpAddr::V6(ip) => v6 && !ip.is_unicast_link_local(),
@@ -167,27 +171,29 @@ fn interface_addrs(local: SocketAddr) -> Vec<SocketAddr> {
         .collect()
 }
 
-/// UTF-8 text if valid and short, else a length-limited hex dump.
+/// Returns the datagram as quoted text if it is printable, else as hex.
+///
+/// Both forms are cut to about 120 chars.
 fn printable(data: &[u8]) -> String {
     const MAX: usize = 120;
     match std::str::from_utf8(data) {
         Ok(text) if !text.chars().any(|c| c.is_control()) => {
-            let mut s: String = text.chars().take(MAX).collect();
+            let mut shown: String = text.chars().take(MAX).collect();
             if text.chars().count() > MAX {
-                s.push_str("...");
+                shown.push_str("...");
             }
-            format!("{s:?}")
+            format!("{shown:?}")
         }
         _ => {
-            let mut s: String = data
+            let mut shown: String = data
                 .iter()
                 .take(MAX / 2)
-                .map(|b| format!("{b:02x}"))
+                .map(|byte| format!("{byte:02x}"))
                 .collect();
             if data.len() > MAX / 2 {
-                s.push_str("...");
+                shown.push_str("...");
             }
-            format!("hex {s}")
+            format!("hex {shown}")
         }
     }
 }

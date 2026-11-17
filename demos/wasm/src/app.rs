@@ -17,7 +17,7 @@ use webview_sockets::UdpSocket;
 
 /// Payload size of the bench datagrams.
 const BENCH_SIZE: usize = 1200;
-/// Receive buffer; GRO records larger than this are returned in parts.
+/// Receive buffer size. GRO records larger than this are returned in parts.
 const RECV_BUF: usize = 64 * 1024;
 /// Queue between the receive loop and a running automation.
 const TAP_CAPACITY: usize = 4096;
@@ -65,12 +65,14 @@ pub struct Demo {
 #[wasm_bindgen]
 pub async fn start() -> Result<Demo, JsError> {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
-    webview_sockets::init().await.map_err(|e| match e.kind() {
-        io::ErrorKind::Unsupported => {
-            js_err(format!("not running in a webview-sockets host app ({e})"))
-        }
-        _ => js_err(e),
-    })?;
+    webview_sockets::init()
+        .await
+        .map_err(|err| match err.kind() {
+            io::ErrorKind::Unsupported => {
+                js_err(format!("not running in a webview-sockets host app ({err})"))
+            }
+            _ => js_err(err),
+        })?;
     let mut notes = Vec::new();
     let sock = match bind("[::]:0").await {
         Ok(sock) => sock,
@@ -120,7 +122,7 @@ impl Demo {
         self.inner
             .sock
             .local_addr()
-            .map(|a| a.to_string())
+            .map(|addr| addr.to_string())
             .unwrap_or_default()
     }
 
@@ -131,7 +133,7 @@ impl Demo {
             .sock
             .interface_addrs()
             .iter()
-            .map(|a| a.to_string())
+            .map(|addr| addr.to_string())
             .collect()
     }
 
@@ -148,13 +150,13 @@ impl Demo {
     }
 
     /// Sets the callback for log lines, called with one string.
-    pub fn set_on_log(&self, cb: Option<Function>) {
-        *self.inner.on_log.borrow_mut() = cb;
+    pub fn set_on_log(&self, callback: Option<Function>) {
+        *self.inner.on_log.borrow_mut() = callback;
     }
 
     /// Sets the callback for a closed socket, called with the reason.
-    pub fn set_on_close(&self, cb: Option<Function>) {
-        *self.inner.on_close.borrow_mut() = cb;
+    pub fn set_on_close(&self, callback: Option<Function>) {
+        *self.inner.on_close.borrow_mut() = callback;
     }
 
     /// Turns echo mode on or off: reply to every datagram with its bytes.
@@ -176,9 +178,9 @@ impl Demo {
     /// length. Returns the segment size.
     pub fn send_gso(&self, peer: &str, text: &str, segments: usize) -> Result<usize, JsError> {
         let peer = parse_peer(peer).map_err(js_err)?;
-        let seg = self.inner.send_gso(peer, text, segments).map_err(js_err)?;
+        let segment_size = self.inner.send_gso(peer, text, segments).map_err(js_err)?;
         self.inner.check_error_soon();
-        Ok(seg)
+        Ok(segment_size)
     }
 
     /// Sends `text` to `peer` until a reply arrives (5 tries, 6 s).
@@ -198,9 +200,10 @@ impl Demo {
         report(async move { inner.gso_expect(&peer, &text, segments).await })
     }
 
-    /// Runs a 1200-byte ping-pong and a windowed throughput test against an
-    /// echo server.
+    /// Runs a ping-pong and a throughput test against an echo server.
     ///
+    /// The ping-pong sends 1200-byte datagrams. The throughput test keeps a
+    /// window of datagrams in flight.
     /// With `gso`, each window refill is one segmented send. Resolves to
     /// `"PASS ..."` or `"FAIL ..."`.
     pub fn bench(&self, peer: String, n: usize, count: usize, window: usize, gso: bool) -> Promise {
@@ -209,7 +212,7 @@ impl Demo {
     }
 }
 
-/// Turns an automation result into a promise of `"PASS ..."`/`"FAIL ..."`.
+/// Turns an automation result into a promise of `"PASS ..."` or `"FAIL ..."`.
 fn report(fut: impl Future<Output = Result<String, String>> + 'static) -> Promise {
     future_to_promise(async move {
         let line = match fut.await {
@@ -231,13 +234,13 @@ fn parse_peer(text: &str) -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
-/// Quoted text if `data` is printable UTF-8, else a hex prefix.
+/// Returns `data` as quoted text if it is printable UTF-8, else as a hex prefix.
 fn printable(data: &[u8]) -> String {
     match std::str::from_utf8(data) {
         Ok(text)
             if !text
                 .chars()
-                .any(|c| matches!(c, '\0'..='\x08' | '\x0e'..='\x1f')) =>
+                .any(|ch| matches!(ch, '\0'..='\x08' | '\x0e'..='\x1f')) =>
         {
             let short: String = text.chars().take(200).collect();
             let more = if short.len() < text.len() { "..." } else { "" };
@@ -262,13 +265,13 @@ async fn recv_loop(inner: Rc<Inner>) {
         if let Err(e) = poll_fn(|cx| inner.sock.poll_recv_ready(cx)).await {
             break e;
         }
-        // Drain everything that is queued; each call may return a GRO batch.
+        // Drain everything that is queued. Each call may return a GRO batch.
         let err = loop {
             match inner.sock.recv_from_segmented(&mut buf) {
                 Ok((0, from, _)) => inner.dispatch(&[], from),
                 Ok((len, from, stride)) => {
-                    for seg in buf[..len].chunks(stride.max(1)) {
-                        inner.dispatch(seg, from);
+                    for datagram in buf[..len].chunks(stride.max(1)) {
+                        inner.dispatch(datagram, from);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break None,
@@ -283,9 +286,10 @@ async fn recv_loop(inner: Rc<Inner>) {
     inner.log(format!("socket closed: {err}"));
     // Wake a waiting automation run.
     inner.tap.borrow_mut().take();
-    let cb = inner.on_close.borrow().clone();
-    if let Some(cb) = cb {
-        cb.call1(&JsValue::NULL, &JsValue::from_str(&err.to_string()))
+    let callback = inner.on_close.borrow().clone();
+    if let Some(callback) = callback {
+        callback
+            .call1(&JsValue::NULL, &JsValue::from_str(&err.to_string()))
             .ok();
     }
 }
@@ -300,13 +304,13 @@ async fn send_segmented(
     sock: &UdpSocket,
     buf: &[u8],
     to: SocketAddr,
-    seg: usize,
+    segment_size: usize,
 ) -> io::Result<()> {
     loop {
         send_ready(sock).await?;
-        match sock.send_to_segmented(buf, to, seg) {
+        match sock.send_to_segmented(buf, to, segment_size) {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            res => return res.map(|_| ()),
+            result => return result.map(|_| ()),
         }
     }
 }
@@ -314,34 +318,38 @@ async fn send_segmented(
 /// Builds `"<text> <i>/<n>"` segments padded to equal length.
 fn gso_batch(text: &str, segments: usize) -> (Vec<u8>, usize) {
     let parts: Vec<String> = (1..=segments)
-        .map(|i| format!("{text} {i}/{segments}"))
+        .map(|index| format!("{text} {index}/{segments}"))
         .collect();
-    let seg = parts.iter().map(|p| p.len()).max().unwrap_or(0).max(1);
-    let mut buf = Vec::with_capacity(seg * segments);
-    for p in &parts {
-        buf.extend_from_slice(p.as_bytes());
-        buf.resize(buf.len() + seg - p.len(), b' ');
+    let segment_size = parts.iter().map(String::len).max().unwrap_or(0).max(1);
+    let mut buf = Vec::with_capacity(segment_size * segments);
+    for part in &parts {
+        buf.extend_from_slice(part.as_bytes());
+        buf.resize(buf.len() + segment_size - part.len(), b' ');
     }
-    (buf, seg)
+    (buf, segment_size)
 }
 
-fn percentile(sorted: &[f64], p: usize) -> f64 {
+/// Returns the `percent` percentile of sorted values, NaN if there are none.
+fn percentile(sorted: &[f64], percent: usize) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
     }
-    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
+    sorted[(sorted.len() * percent / 100).min(sorted.len() - 1)]
 }
 
+/// Returns the sequence number at the start of a bench datagram.
 fn seq_of(data: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(data.get(..4)?.try_into().ok()?))
 }
 
 impl Inner {
     fn log(&self, line: String) {
-        let cb = self.on_log.borrow().clone();
-        match cb {
-            Some(cb) => {
-                cb.call1(&JsValue::NULL, &JsValue::from_str(&line)).ok();
+        let callback = self.on_log.borrow().clone();
+        match callback {
+            Some(callback) => {
+                callback
+                    .call1(&JsValue::NULL, &JsValue::from_str(&line))
+                    .ok();
             }
             None => console_log(&line),
         }
@@ -413,13 +421,13 @@ impl Inner {
         segments: usize,
     ) -> io::Result<usize> {
         let segments = segments.clamp(1, 64);
-        let (buf, seg) = gso_batch(text, segments);
-        self.sock.send_to_segmented(&buf, peer, seg)?;
+        let (buf, segment_size) = gso_batch(text, segments);
+        self.sock.send_to_segmented(&buf, peer, segment_size)?;
         self.log(format!(
-            "-> {peer} GSO batch of {segments} x {seg} bytes (host max_gso_segments={})",
+            "-> {peer} GSO batch of {segments} x {segment_size} bytes (host max_gso_segments={})",
             self.sock.max_gso_segments()
         ));
-        Ok(seg)
+        Ok(segment_size)
     }
 
     async fn send_expect(
@@ -430,9 +438,9 @@ impl Inner {
     ) -> Result<String, String> {
         let peer = parse_peer(peer)?;
         let mut rx = self.tap(false);
-        let res = self.send_expect_inner(&mut rx, peer, text, expect).await;
+        let result = self.send_expect_inner(&mut rx, peer, text, expect).await;
         self.untap();
-        res
+        result
     }
 
     async fn send_expect_inner(
@@ -451,10 +459,10 @@ impl Inner {
             if now >= deadline {
                 return Err(format!("no reply from {peer} within 6 s"));
             }
-            // UDP may drop: resend once per second, up to 5 times.
+            // UDP may drop datagrams, so resend once per second, up to 5 times.
             if now >= next_send && tries < 5 {
                 self.send_text(peer, text)
-                    .map_err(|e| format!("send: {e}"))?;
+                    .map_err(|err| format!("send: {err}"))?;
                 tries += 1;
                 next_send = now + Duration::from_secs(1);
             }
@@ -468,21 +476,21 @@ impl Inner {
             };
             // Wake regularly to notice per-send errors from the host.
             let wake = wake.min(now + ERROR_POLL);
-            let pkt = match timeout(wake.saturating_duration_since(now), rx.recv()).await {
-                Ok(Some(pkt)) => pkt,
+            let packet = match timeout(wake.saturating_duration_since(now), rx.recv()).await {
+                Ok(Some(packet)) => packet,
                 Ok(None) => return Err("socket closed".into()),
                 Err(_) => continue,
             };
-            if pkt.from.port() != peer.port() {
+            if packet.from.port() != peer.port() {
                 continue;
             }
-            let got = String::from_utf8_lossy(&pkt.data);
+            let got = String::from_utf8_lossy(&packet.data);
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             return match expect {
                 Some(want) if got != want => {
                     Err(format!("expected {want:?} from {peer}, got {got:?}"))
                 }
-                _ => Ok(format!("reply {got:?} from {} in {ms:.2} ms", pkt.from)),
+                _ => Ok(format!("reply {got:?} from {} in {ms:.2} ms", packet.from)),
             };
         }
     }
@@ -496,9 +504,9 @@ impl Inner {
         let peer = parse_peer(peer)?;
         let segments = segments.clamp(1, 64);
         let mut rx = self.tap(false);
-        let res = self.gso_expect_inner(&mut rx, peer, text, segments).await;
+        let result = self.gso_expect_inner(&mut rx, peer, text, segments).await;
         self.untap();
-        res
+        result
     }
 
     async fn gso_expect_inner(
@@ -508,13 +516,13 @@ impl Inner {
         text: &str,
         segments: usize,
     ) -> Result<String, String> {
-        let (buf, seg) = gso_batch(text, segments);
-        let want: BTreeSet<Vec<u8>> = buf.chunks(seg).map(|c| c.to_vec()).collect();
+        let (buf, segment_size) = gso_batch(text, segments);
+        let want: BTreeSet<Vec<u8>> = buf.chunks(segment_size).map(<[u8]>::to_vec).collect();
         let mut got = BTreeSet::new();
         let start = Instant::now();
         for _ in 0..5 {
             self.send_gso(peer, text, segments)
-                .map_err(|e| format!("send: {e}"))?;
+                .map_err(|err| format!("send: {err}"))?;
             let round = Instant::now() + Duration::from_secs(1);
             loop {
                 if let Ok(Some(e)) = self.sock.take_error() {
@@ -523,9 +531,9 @@ impl Inner {
                 let now = Instant::now();
                 let left = round.saturating_duration_since(now).min(ERROR_POLL);
                 match timeout(left, rx.recv()).await {
-                    Ok(Some(pkt)) if pkt.from.port() == peer.port() => {
-                        if want.contains(&pkt.data) {
-                            got.insert(pkt.data);
+                    Ok(Some(packet)) if packet.from.port() == peer.port() => {
+                        if want.contains(&packet.data) {
+                            got.insert(packet.data);
                         }
                     }
                     Ok(Some(_)) => {}
@@ -536,7 +544,7 @@ impl Inner {
                 if got.len() == want.len() {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
                     return Ok(format!(
-                        "gso {segments} x {seg} B echoed by {peer} in {ms:.2} ms \
+                        "gso {segments} x {segment_size} B echoed by {peer} in {ms:.2} ms \
                          (max_gso_segments={} gro_segments={})",
                         self.sock.max_gso_segments(),
                         self.sock.gro_segments()
@@ -558,13 +566,13 @@ impl Inner {
         window: usize,
         gso: bool,
     ) -> Result<String, String> {
-        let peer = parse_peer(peer).map_err(|e| format!("bench: {e}"))?;
+        let peer = parse_peer(peer).map_err(|err| format!("bench: {err}"))?;
         let mut rx = self.tap(true);
-        let res = self
+        let result = self
             .bench_inner(&mut rx, peer, n, count, window.max(1), gso)
             .await;
         self.untap();
-        res.map_err(|e| format!("bench: {e}"))
+        result.map_err(|err| format!("bench: {err}"))
     }
 
     async fn bench_inner(
@@ -597,7 +605,7 @@ impl Inner {
         let pps = received as f64 / secs;
         let mbit = pps * (BENCH_SIZE * 8) as f64 / 1e6;
         let tput_line = format!(
-            "tput {pps:.0} pkt/s each way {mbit:.1} Mbit/s each way lost={lost}/{count} \
+            "tput {pps:.0} packet/s each way {mbit:.1} Mbit/s each way lost={lost}/{count} \
              time={secs:.2}s window={window} gso={gso}"
         );
         self.log(format!("bench: {tput_line}"));
@@ -607,7 +615,7 @@ impl Inner {
         Ok(format!("bench {rtt_line} {tput_line}"))
     }
 
-    /// Sequential ping-pong; returns the RTTs in ms and the lost count.
+    /// Runs a sequential ping-pong and returns the RTTs in ms and the lost count.
     async fn bench_rtt(
         &self,
         rx: &mut mpsc::Receiver<Packet>,
@@ -623,12 +631,12 @@ impl Inner {
             let start = Instant::now();
             send_segmented(&self.sock, &payload, peer, 0)
                 .await
-                .map_err(|e| format!("send: {e}"))?;
+                .map_err(|err| format!("send: {err}"))?;
             let deadline = start + Duration::from_secs(1);
             let ok = loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 match timeout(left, rx.recv()).await {
-                    Ok(Some(pkt)) if seq_of(&pkt.data) == Some(i) => break true,
+                    Ok(Some(packet)) if seq_of(&packet.data) == Some(i) => break true,
                     Ok(Some(_)) => continue,
                     Ok(None) => return Err("socket closed".into()),
                     Err(_) => break false,
@@ -647,10 +655,10 @@ impl Inner {
         Ok((rtts, lost))
     }
 
-    /// Keeps `window` datagrams in flight until `count` replies arrived or
-    /// were declared lost (no reply for 300 ms).
+    /// Keeps `window` datagrams in flight until `count` replies are counted.
     ///
-    /// Returns (received, lost, seconds).
+    /// A datagram without a reply for 300 ms counts as lost. Returns the
+    /// received and lost counts and the elapsed seconds.
     async fn bench_throughput(
         &self,
         rx: &mut mpsc::Receiver<Packet>,
@@ -677,24 +685,24 @@ impl Inner {
                 } else {
                     send_segmented(&self.sock, &payload, peer, 0)
                         .await
-                        .map_err(|e| format!("send: {e}"))?;
+                        .map_err(|err| format!("send: {err}"))?;
                 }
                 sent += 1;
             }
             if !batch.is_empty() {
                 send_segmented(&self.sock, &batch, peer, BENCH_SIZE)
                     .await
-                    .map_err(|e| format!("send: {e}"))?;
+                    .map_err(|err| format!("send: {err}"))?;
             }
             match timeout(Duration::from_millis(300), rx.recv()).await {
-                Ok(Some(pkt)) => {
-                    let mut pkt = Some(pkt);
+                Ok(Some(packet)) => {
+                    let mut next = Some(packet);
                     // Count everything already queued before refilling.
-                    while let Some(p) = pkt {
-                        if seq_of(&p.data).is_some_and(|s| s as usize >= floor) {
+                    while let Some(packet) = next {
+                        if seq_of(&packet.data).is_some_and(|seq| seq as usize >= floor) {
                             received += 1;
                         }
-                        pkt = rx.try_recv().ok();
+                        next = rx.try_recv().ok();
                     }
                 }
                 Ok(None) => return Err("socket closed".into()),

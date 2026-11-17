@@ -22,8 +22,8 @@
 
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
 
   let sock = null;
   // Called for each received datagram before the default handler; return
@@ -33,17 +33,17 @@
   // ---- UI helpers ----
 
   function log(line) {
-    const el = $("log");
-    const lines = el.textContent.split("\n");
-    if (lines.length > MAX_LOG_LINES) el.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
-    el.textContent += `${new Date().toLocaleTimeString()} ${line}\n`;
-    el.scrollTop = el.scrollHeight;
+    const element = $("log");
+    const lines = element.textContent.split("\n");
+    if (lines.length > MAX_LOG_LINES) element.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
+    element.textContent += `${new Date().toLocaleTimeString()} ${line}\n`;
+    element.scrollTop = element.scrollHeight;
   }
 
   function setStatus(text, kind) {
-    const el = $("status");
-    el.textContent = text;
-    el.className = `status ${kind}`;
+    const element = $("status");
+    element.textContent = text;
+    element.className = `status ${kind}`;
   }
 
   function result(ok, detail) {
@@ -53,7 +53,7 @@
     log(line);
   }
 
-  function fmtAddr(address, port) {
+  function formatAddr(address, port) {
     return address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`;
   }
 
@@ -61,56 +61,56 @@
 
   // "name:5", "1.2.3.4:5" or "[::1]:5" -> { address, port }.
   function parseHostPort(text) {
-    const m = /^\s*(?:\[([0-9a-fA-F:.]+)\]|([^\s:\[\]]+)):(\d{1,5})\s*$/.exec(text);
-    if (!m) throw new Error(`expected host:port, got "${text}"`);
-    const port = Number(m[3]);
+    const match = /^\s*(?:\[([0-9a-fA-F:.]+)\]|([^\s:\[\]]+)):(\d{1,5})\s*$/.exec(text);
+    if (!match) throw new Error(`expected host:port, got "${text}"`);
+    const port = Number(match[3]);
     if (port < 1 || port > 65535) throw new Error(`bad port ${port}`);
-    return { address: m[1] || m[2], port };
+    return { address: match[1] || match[2], port };
   }
 
   // "1.2.3.4:5" or "[::1]:5" -> { address, port }.
   function parsePeer(text) {
-    const m = /^\s*(?:\[([0-9a-fA-F:.]+)\]|([0-9.]+)):(\d{1,5})\s*$/.exec(text);
-    if (!m) throw new Error(`peer must be ip:port or [ipv6]:port, got "${text}"`);
-    const port = Number(m[3]);
+    const match = /^\s*(?:\[([0-9a-fA-F:.]+)\]|([0-9.]+)):(\d{1,5})\s*$/.exec(text);
+    if (!match) throw new Error(`peer must be ip:port or [ipv6]:port, got "${text}"`);
+    const port = Number(match[3]);
     if (port < 1 || port > 65535) throw new Error(`bad port ${port}`);
-    return { address: m[1] || m[2], port };
+    return { address: match[1] || match[2], port };
   }
 
   function printable(data) {
-    const text = dec.decode(data);
+    const text = decoder.decode(data);
     // eslint-disable-next-line no-control-regex
     if (!text.includes("\uFFFD") && !/[\x00-\x08\x0e-\x1f]/.test(text)) {
       return JSON.stringify(text.length > 200 ? `${text.slice(0, 200)}...` : text);
     }
-    const hex = Array.from(data.subarray(0, 32), (b) => b.toString(16).padStart(2, "0")).join("");
+    const hex = Array.from(data.subarray(0, 32), (byte) => byte.toString(16).padStart(2, "0")).join("");
     return `hex ${hex}${data.length > 32 ? "..." : ""}`;
   }
 
   function addrRow(label, value) {
-    const li = document.createElement("li");
-    const l = document.createElement("span");
-    l.className = "label";
-    l.textContent = label;
-    const v = document.createElement("code");
-    v.textContent = value;
+    const item = document.createElement("li");
+    const labelElement = document.createElement("span");
+    labelElement.className = "label";
+    labelElement.textContent = label;
+    const valueElement = document.createElement("code");
+    valueElement.textContent = value;
     const copy = document.createElement("button");
     copy.className = "small";
     copy.textContent = "copy";
     copy.onclick = () => navigator.clipboard?.writeText(value).catch(() => {});
-    li.append(l, v, copy);
-    $("addrs").append(li);
+    item.append(labelElement, valueElement, copy);
+    $("addrs").append(item);
   }
 
   // ---- setup ----
 
   function loadScript(src) {
     return new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = src;
-      s.onload = resolve;
-      s.onerror = () => reject(new Error(`could not load ${src}`));
-      document.head.append(s);
+      const script = document.createElement("script");
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = () => reject(new Error(`could not load ${src}`));
+      document.head.append(script);
     });
   }
 
@@ -139,7 +139,7 @@
     const info = await socket.opened;
     const writer = info.writable.getWriter();
     const reader = info.readable.getReader();
-    const s = {
+    const wrapped = {
       localAddress: info.localAddress,
       localPort: info.localPort,
       remoteAddress: info.remoteAddress ?? null,
@@ -152,9 +152,9 @@
       onerror: null,
       onclose: null,
       send(data, address, port) {
-        const msg = { data: typeof data === "string" ? enc.encode(data) : data };
-        if (address !== undefined) Object.assign(msg, { remoteAddress: address, remotePort: port });
-        writer.write(msg).catch((err) => s.onerror?.({ name: err.name, code: err.name, message: err.message }));
+        const message = { data: typeof data === "string" ? encoder.encode(data) : data };
+        if (address !== undefined) Object.assign(message, { remoteAddress: address, remotePort: port });
+        writer.write(message).catch((err) => wrapped.onerror?.({ name: err.name, code: err.name, message: err.message }));
       },
       close() {
         writer.releaseLock();
@@ -162,20 +162,20 @@
         socket.close().catch(() => {});
       },
     };
-    socket.onsenderror = (err) => s.onerror?.({ name: err.name, code: err.name, message: err.message });
+    socket.onsenderror = (err) => wrapped.onerror?.({ name: err.name, code: err.name, message: err.message });
     socket.closed.then(() => ({ code: 1000, reason: "" }), (err) => ({ code: 0, reason: `${err.name}: ${err.message}` }))
-      .then((ev) => {
-        s.closed = true;
-        s.onclose?.(ev);
+      .then((event) => {
+        wrapped.closed = true;
+        wrapped.onclose?.(event);
       });
     (async () => {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        s.onmessage?.({ data: value.data, address: value.remoteAddress, port: value.remotePort, ecn: value.ecn ?? 0 });
+        wrapped.onmessage?.({ data: value.data, address: value.remoteAddress, port: value.remotePort, ecn: value.ecn ?? 0 });
       }
     })().catch(() => {});
-    return s;
+    return wrapped;
   }
 
   function bind(host, localAddress) {
@@ -200,20 +200,20 @@
     }
   }
 
-  function onDatagram(msg) {
-    if (tap && tap(msg)) return;
-    const from = fmtAddr(msg.address, msg.port);
-    log(`<- ${from} ${msg.data.length} bytes: ${printable(msg.data)}`);
+  function onDatagram(message) {
+    if (tap && tap(message)) return;
+    const from = formatAddr(message.address, message.port);
+    log(`<- ${from} ${message.data.length} bytes: ${printable(message.data)}`);
     if ($("echo").checked) {
-      sock.send(msg.data, msg.address, msg.port);
-      log(`-> ${from} echo ${msg.data.length} bytes`);
+      sock.send(message.data, message.address, message.port);
+      log(`-> ${from} echo ${message.data.length} bytes`);
     }
   }
 
   function sendText(peerText, text) {
     const peer = parsePeer(peerText);
-    sock.send(enc.encode(text), peer.address, peer.port);
-    log(`-> ${fmtAddr(peer.address, peer.port)} ${JSON.stringify(text)}`);
+    sock.send(encoder.encode(text), peer.address, peer.port);
+    log(`-> ${formatAddr(peer.address, peer.port)} ${JSON.stringify(text)}`);
     return peer;
   }
 
@@ -227,11 +227,11 @@
       result(false, err.message);
       return;
     }
-    const want = fmtAddr(peer.address, peer.port);
+    const want = formatAddr(peer.address, peer.port);
     const reply = new Promise((resolve) => {
-      tap = (msg) => {
-        if (msg.port !== peer.port) return false;
-        resolve(msg);
+      tap = (message) => {
+        if (message.port !== peer.port) return false;
+        resolve(message);
         return false; // still log it
       };
     });
@@ -245,19 +245,19 @@
     };
     resend(5);
     const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 6000));
-    const msg = await Promise.race([reply, timeout]);
+    const message = await Promise.race([reply, timeout]);
     clearTimeout(timer);
     tap = null;
-    if (!msg) {
+    if (!message) {
       result(false, `no reply from ${want} within 6 s`);
       return;
     }
-    const got = dec.decode(msg.data);
+    const got = decoder.decode(message.data);
     const ms = (performance.now() - start).toFixed(2);
     if (expect !== null && got !== expect) {
       result(false, `expected ${JSON.stringify(expect)} from ${want}, got ${JSON.stringify(got)}`);
     } else {
-      result(true, `reply ${JSON.stringify(got)} from ${fmtAddr(msg.address, msg.port)} in ${ms} ms`);
+      result(true, `reply ${JSON.stringify(got)} from ${formatAddr(message.address, message.port)} in ${ms} ms`);
     }
   }
 
@@ -266,33 +266,33 @@
   // Opens a socket connected to host:port (the app resolves a name), sends
   // `text` until a reply arrives and reports it.
   async function runConnected(host, target, text, expect) {
-    let c;
+    let connected;
     try {
       const peer = parseHostPort(target);
-      c = await connect(host, peer.address, peer.port, params.get("dnsQueryType"));
-      log(`connected ${fmtAddr(c.localAddress, c.localPort)} -> ${fmtAddr(c.remoteAddress, c.remotePort)} (${peer.address})`);
+      connected = await connect(host, peer.address, peer.port, params.get("dnsQueryType"));
+      log(`connected ${formatAddr(connected.localAddress, connected.localPort)} -> ${formatAddr(connected.remoteAddress, connected.remotePort)} (${peer.address})`);
       let failed;
       const error = new Promise((resolve) => { failed = resolve; });
-      c.onerror = ({ code, message }) => failed(`${code}: ${message}`);
+      connected.onerror = ({ code, message }) => failed(`${code}: ${message}`);
       const reply = new Promise((resolve) => {
-        c.onmessage = (msg) => {
-          log(`<- (connected) ${msg.data.length} bytes: ${printable(msg.data)}`);
-          resolve(dec.decode(msg.data));
+        connected.onmessage = (message) => {
+          log(`<- (connected) ${message.data.length} bytes: ${printable(message.data)}`);
+          resolve(decoder.decode(message.data));
         };
       });
       const start = performance.now();
       let timer;
       const resend = (left) => {
-        if (c.closed) return;
-        c.send(enc.encode(text));
+        if (connected.closed) return;
+        connected.send(encoder.encode(text));
         log(`-> (connected) ${JSON.stringify(text)}`);
         if (left > 1) timer = setTimeout(() => resend(left - 1), 1000);
       };
       resend(5);
       const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 6000));
-      const got = await Promise.race([reply, error.then((e) => ({ error: e })), timeout]);
+      const got = await Promise.race([reply, error.then((err) => ({ error: err })), timeout]);
       clearTimeout(timer);
-      const where = `${fmtAddr(c.remoteAddress, c.remotePort)} (connected to ${peer.address})`;
+      const where = `${formatAddr(connected.remoteAddress, connected.remotePort)} (connected to ${peer.address})`;
       if (got === null) result(false, `no reply from ${where} within 6 s`);
       else if (got.error) result(false, `send error: ${got.error}`);
       else if (expect !== null && got !== expect) result(false, `expected ${JSON.stringify(expect)} from ${where}, got ${JSON.stringify(got)}`);
@@ -300,7 +300,7 @@
     } catch (err) {
       result(false, `connected socket to ${target}: ${err.name}: ${err.message}`);
     } finally {
-      c?.close();
+      connected?.close();
     }
   }
 
@@ -312,24 +312,24 @@
   }
 
   // Sequential 1200-byte ping-pong; returns RTTs in ms.
-  async function benchRtt(peer, n, warmup) {
+  async function benchRtt(peer, rounds, warmup) {
     const payload = new Uint8Array(BENCH_SIZE);
     const view = new DataView(payload.buffer);
     const rtts = [];
     let lost = 0;
     let waiting = null; // { seq, resolve }
-    tap = (msg) => {
-      if (msg.data.length >= 4 && waiting) {
-        const seq = new DataView(msg.data.buffer, msg.data.byteOffset).getUint32(0);
+    tap = (message) => {
+      if (message.data.length >= 4 && waiting) {
+        const seq = new DataView(message.data.buffer, message.data.byteOffset).getUint32(0);
         if (seq === waiting.seq) waiting.resolve(true);
       }
       return true;
     };
-    for (let i = 0; i < warmup + n; i++) {
+    for (let i = 0; i < warmup + rounds; i++) {
       view.setUint32(0, i);
       const got = new Promise((resolve) => {
-        const t = setTimeout(() => resolve(false), 1000);
-        waiting = { seq: i, resolve: (v) => { clearTimeout(t); resolve(v); } };
+        const timer = setTimeout(() => resolve(false), 1000);
+        waiting = { seq: i, resolve: (value) => { clearTimeout(timer); resolve(value); } };
       });
       const start = performance.now();
       sock.send(payload, peer.address, peer.port);
@@ -343,9 +343,9 @@
     return { rtts, lost };
   }
 
-  // Keeps `win` datagrams in flight until `count` replies arrived or were
+  // Keeps `windowSize` datagrams in flight until `count` replies arrived or were
   // declared lost (no reply for 300 ms refills the window).
-  async function benchThroughput(peer, count, win) {
+  async function benchThroughput(peer, count, windowSize) {
     const payload = new Uint8Array(BENCH_SIZE);
     const view = new DataView(payload.buffer);
     let sent = 0;
@@ -357,7 +357,7 @@
       sock.send(payload, peer.address, peer.port);
     };
     const fill = () => {
-      while (sent < count && sent - received - lost < win) sendOne();
+      while (sent < count && sent - received - lost < windowSize) sendOne();
     };
     return new Promise((resolve) => {
       const start = performance.now();
@@ -397,27 +397,27 @@
       result(false, `bench: ${err.message}`);
       return;
     }
-    const n = Number(params.get("n") || 2000);
+    const rounds = Number(params.get("n") || 2000);
     const count = Number(params.get("count") || 20000);
-    const win = Number(params.get("window") || 64);
+    const windowSize = Number(params.get("window") || 64);
     $("send").disabled = true;
-    log(`bench: ${n} x ${BENCH_SIZE} B ping-pong to ${fmtAddr(peer.address, peer.port)}`);
-    const { rtts, lost } = await benchRtt(peer, n, 50);
-    const sorted = rtts.slice().sort((a, b) => a - b);
-    const mean = rtts.reduce((a, b) => a + b, 0) / (rtts.length || 1);
+    log(`bench: ${rounds} x ${BENCH_SIZE} B ping-pong to ${formatAddr(peer.address, peer.port)}`);
+    const { rtts, lost } = await benchRtt(peer, rounds, 50);
+    const sorted = rtts.slice().sort((left, right) => left - right);
+    const mean = rtts.reduce((sum, rtt) => sum + rtt, 0) / (rtts.length || 1);
     const rttLine = `rtt p50=${percentile(sorted, 50).toFixed(3)}ms p99=${percentile(sorted, 99).toFixed(3)}ms `
-      + `mean=${mean.toFixed(3)}ms min=${(sorted[0] ?? NaN).toFixed(3)}ms lost=${lost}/${n}`;
+      + `mean=${mean.toFixed(3)}ms min=${(sorted[0] ?? NaN).toFixed(3)}ms lost=${lost}/${rounds}`;
     log(`bench: ${rttLine}`);
 
-    log(`bench: throughput ${count} x ${BENCH_SIZE} B, window ${win}`);
-    const t = await benchThroughput(peer, count, win);
-    const pps = t.received / t.secs;
+    log(`bench: throughput ${count} x ${BENCH_SIZE} B, window ${windowSize}`);
+    const throughput = await benchThroughput(peer, count, windowSize);
+    const pps = throughput.received / throughput.secs;
     const mbit = (pps * BENCH_SIZE * 8) / 1e6;
     const tputLine = `tput ${Math.round(pps)} pkt/s each way ${mbit.toFixed(1)} Mbit/s each way `
-      + `lost=${t.lost}/${count} time=${t.secs.toFixed(2)}s window=${win}`;
+      + `lost=${throughput.lost}/${count} time=${throughput.secs.toFixed(2)}s window=${windowSize}`;
     log(`bench: ${tputLine}`);
     $("send").disabled = false;
-    const ok = rtts.length > 0 && t.received > 0;
+    const ok = rtts.length > 0 && throughput.received > 0;
     result(ok, `bench ${rttLine} ${tputLine}`);
   }
 
@@ -442,9 +442,9 @@
     }
 
     setStatus(`Native UDP: available (${useUdpSocket ? "UDPSocket" : "webviewSockets.udp"})`, "ok");
-    addrRow("bound", fmtAddr(sock.localAddress, sock.localPort));
-    for (const a of sock.interfaceAddrs) addrRow("interface", fmtAddr(a.address, a.port));
-    log(`bound ${fmtAddr(sock.localAddress, sock.localPort)}, gso=${sock.maxGsoSegments} gro=${sock.groSegments}`);
+    addrRow("bound", formatAddr(sock.localAddress, sock.localPort));
+    for (const a of sock.interfaceAddrs) addrRow("interface", formatAddr(a.address, a.port));
+    log(`bound ${formatAddr(sock.localAddress, sock.localPort)}, gso=${sock.maxGsoSegments} gro=${sock.groSegments}`);
 
     sock.onmessage = onDatagram;
     sock.onerror = ({ code, message }) => log(`error ${code}: ${message}`);

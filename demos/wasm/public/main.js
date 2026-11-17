@@ -16,17 +16,17 @@ const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 
 function log(line) {
-  const el = $("log");
-  const lines = el.textContent.split("\n");
-  if (lines.length > MAX_LOG_LINES) el.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
-  el.textContent += `${new Date().toLocaleTimeString()} ${line}\n`;
-  el.scrollTop = el.scrollHeight;
+  const element = $("log");
+  const lines = element.textContent.split("\n");
+  if (lines.length > MAX_LOG_LINES) element.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
+  element.textContent += `${new Date().toLocaleTimeString()} ${line}\n`;
+  element.scrollTop = element.scrollHeight;
 }
 
 function setStatus(text, kind) {
-  const el = $("status");
-  el.textContent = text;
-  el.className = `status ${kind}`;
+  const element = $("status");
+  element.textContent = text;
+  element.className = `status ${kind}`;
 }
 
 // line is "PASS ..." or "FAIL ...".
@@ -38,33 +38,33 @@ function result(line) {
 }
 
 function addrRow(label, value) {
-  const li = document.createElement("li");
-  const l = document.createElement("span");
-  l.className = "label";
-  l.textContent = label;
-  const v = document.createElement("code");
-  v.textContent = value;
+  const item = document.createElement("li");
+  const labelElement = document.createElement("span");
+  labelElement.className = "label";
+  labelElement.textContent = label;
+  const valueElement = document.createElement("code");
+  valueElement.textContent = value;
   const copy = document.createElement("button");
   copy.className = "small";
   copy.textContent = "copy";
   copy.onclick = () => navigator.clipboard?.writeText(value).catch(() => {});
-  li.append(l, v, copy);
-  $("addrs").append(li);
+  item.append(labelElement, valueElement, copy);
+  $("addrs").append(item);
 }
 
 // Outside a webview-sockets host app, try the test-host dev script.
 async function loadHostScript() {
   if (window.webviewSockets) return;
   await new Promise((resolve) => {
-    const s = document.createElement("script");
-    s.src = HOST_JS;
-    s.onload = resolve;
-    s.onerror = resolve;
-    document.head.append(s);
+    const script = document.createElement("script");
+    script.src = HOST_JS;
+    script.onload = resolve;
+    script.onerror = resolve;
+    document.head.append(script);
   });
 }
 
-const num = (name, def) => Number(params.get(name) || def);
+const numberParam = (name, fallback) => Number(params.get(name) || fallback);
 
 async function main() {
   $("echo").checked = params.get("echo") === "1";
@@ -95,12 +95,12 @@ async function main() {
 
   setStatus("Native UDP: available (Rust)", "ok");
   addrRow("bound", demo.local_addr);
-  for (const a of demo.interface_addrs) addrRow("interface", a);
+  for (const addr of demo.interface_addrs) addrRow("interface", addr);
   log(`bound ${demo.local_addr}, gso=${demo.max_gso_segments} gro=${demo.gro_segments}`);
 
-  const guard = (f) => {
+  const guard = (action) => {
     try {
-      f();
+      action();
     } catch (err) {
       log(`send failed: ${err.message}`);
     }
@@ -115,12 +115,12 @@ async function main() {
 
   if (params.get("bench")) {
     $("send").disabled = true;
-    const line = await demo.bench(params.get("bench"), num("n", 2000), num("count", 20000),
-      num("window", 64), params.get("gso") === "1");
+    const line = await demo.bench(params.get("bench"), numberParam("n", 2000), numberParam("count", 20000),
+      numberParam("window", 64), params.get("gso") === "1");
     $("send").disabled = false;
     result(line);
   } else if (params.get("peer") && params.has("gso")) {
-    result(await demo.gso_expect(params.get("peer"), params.get("send") || "gso", num("gso", 4)));
+    result(await demo.gso_expect(params.get("peer"), params.get("send") || "gso", numberParam("gso", 4)));
   } else if (params.get("peer") && params.has("send")) {
     result(await demo.send_expect(params.get("peer"), params.get("send"), params.get("expect")));
   }
